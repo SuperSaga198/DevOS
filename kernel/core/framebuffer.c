@@ -10,6 +10,33 @@ static uint16_t terminal_rows;
 static uint16_t terminal_column;
 static uint16_t terminal_row;
 static char terminal_cells[80][160];
+#define CURSOR_WIDTH 12
+#define CURSOR_HEIGHT 16
+static uint32_t cursor_background[CURSOR_HEIGHT][CURSOR_WIDTH];
+static uint64_t cursor_x;
+static uint64_t cursor_y;
+static uint8_t cursor_visible;
+static uint8_t cursor_background_width;
+static uint8_t cursor_background_height;
+
+static const char *const cursor_shape[CURSOR_HEIGHT] = {
+    "B...........",
+    "BB..........",
+    "BWB.........",
+    "BWWB........",
+    "BWWWB.......",
+    "BWWWWB......",
+    "BWWWWWB.....",
+    "BWWWWWWB....",
+    "BWWWWWWWB...",
+    "BWWBBBBBB...",
+    "BWBWB.......",
+    "BB.BWB......",
+    "B...BWB.....",
+    ".....BWB....",
+    "......BB....",
+    "............",
+};
 
 static uint32_t channel(uint8_t value, uint8_t width, uint8_t shift)
 {
@@ -31,6 +58,61 @@ static uint32_t pixel_value(uint32_t color)
                    active_framebuffer->green_mask_shift) |
            channel((uint8_t)blue, active_framebuffer->blue_mask_size,
                    active_framebuffer->blue_mask_shift);
+}
+
+static volatile uint32_t *framebuffer_pixel(uint64_t x, uint64_t y)
+{
+    return (volatile uint32_t *)((uintptr_t)active_framebuffer->address +
+                                 y * active_framebuffer->pitch) + x;
+}
+
+static void cursor_restore(void)
+{
+    if (!cursor_visible || active_framebuffer == NULL) {
+        return;
+    }
+    for (uint8_t row = 0; row < cursor_background_height; ++row) {
+        for (uint8_t column = 0; column < cursor_background_width; ++column) {
+            *framebuffer_pixel(cursor_x + column, cursor_y + row) =
+                cursor_background[row][column];
+        }
+    }
+    cursor_visible = 0;
+}
+
+static void cursor_draw(void)
+{
+    if (active_framebuffer == NULL || active_framebuffer->width == 0 ||
+        active_framebuffer->height == 0) {
+        return;
+    }
+    if (cursor_x >= active_framebuffer->width) {
+        cursor_x = active_framebuffer->width - 1;
+    }
+    if (cursor_y >= active_framebuffer->height) {
+        cursor_y = active_framebuffer->height - 1;
+    }
+
+    cursor_background_width = (uint8_t)(
+        active_framebuffer->width - cursor_x < CURSOR_WIDTH
+            ? active_framebuffer->width - cursor_x : CURSOR_WIDTH);
+    cursor_background_height = (uint8_t)(
+        active_framebuffer->height - cursor_y < CURSOR_HEIGHT
+            ? active_framebuffer->height - cursor_y : CURSOR_HEIGHT);
+    for (uint8_t row = 0; row < cursor_background_height; ++row) {
+        for (uint8_t column = 0; column < cursor_background_width; ++column) {
+            cursor_background[row][column] =
+                *framebuffer_pixel(cursor_x + column, cursor_y + row);
+            if (cursor_shape[row][column] == 'B') {
+                *framebuffer_pixel(cursor_x + column, cursor_y + row) =
+                    pixel_value(0x101521);
+            } else if (cursor_shape[row][column] == 'W') {
+                *framebuffer_pixel(cursor_x + column, cursor_y + row) =
+                    pixel_value(0xf3f6fc);
+            }
+        }
+    }
+    cursor_visible = 1;
 }
 
 int framebuffer_init(struct limine_framebuffer *framebuffer)
@@ -94,6 +176,39 @@ void framebuffer_rect(uint64_t x, uint64_t y, uint64_t width,
         for (uint64_t column = 0; column < width; ++column) {
             pixels[column] = value;
         }
+    }
+}
+
+uint64_t framebuffer_width(void)
+{
+    return active_framebuffer != NULL ? active_framebuffer->width : 0;
+}
+
+uint64_t framebuffer_height(void)
+{
+    return active_framebuffer != NULL ? active_framebuffer->height : 0;
+}
+
+void framebuffer_cursor_set(uint64_t x, uint64_t y)
+{
+    const uint8_t should_show = cursor_visible;
+    cursor_restore();
+    cursor_x = x;
+    cursor_y = y;
+    if (should_show) {
+        cursor_draw();
+    }
+}
+
+void framebuffer_cursor_hide(void)
+{
+    cursor_restore();
+}
+
+void framebuffer_cursor_show(void)
+{
+    if (!cursor_visible) {
+        cursor_draw();
     }
 }
 

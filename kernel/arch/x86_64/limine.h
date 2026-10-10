@@ -10,6 +10,8 @@
     0x9d5827dcd881dd75, 0xa3148604f6fab11b
 #define LIMINE_MEMMAP_REQUEST_ID \
     0x67cf3d9d378a806f, 0xe304acdfc50c3c62
+#define LIMINE_HHDM_REQUEST_ID \
+    0x48dcf1cb8ad2b852, 0x63984e959a98244b
 
 #define LIMINE_MEMMAP_USABLE 0
 #define LIMINE_FRAMEBUFFER_RGB 1
@@ -62,6 +64,17 @@ struct limine_memmap_request {
     uint64_t id[4];
     uint64_t revision;
     struct limine_memmap_response *response;
+};
+
+struct limine_hhdm_response {
+    uint64_t revision;
+    uint64_t offset;
+};
+
+struct limine_hhdm_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_hhdm_response *response;
 };
 
 #endif

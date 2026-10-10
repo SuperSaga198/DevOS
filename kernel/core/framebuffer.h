@@ -14,5 +14,10 @@ void framebuffer_terminal_open(void);
 void framebuffer_terminal_clear(void);
 void framebuffer_terminal_write(const char *text);
 void framebuffer_terminal_backspace(void);
+uint64_t framebuffer_width(void);
+uint64_t framebuffer_height(void);
+void framebuffer_cursor_set(uint64_t x, uint64_t y);
+void framebuffer_cursor_hide(void);
+void framebuffer_cursor_show(void);
 
 #endif

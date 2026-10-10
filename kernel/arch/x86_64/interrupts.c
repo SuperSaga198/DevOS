@@ -1,7 +1,9 @@
 #include "interrupts.h"
 
 #include "keyboard.h"
+#include "mouse.h"
 #include "serial.h"
+#include "timer.h"
 
 #include <stdint.h>
 
@@ -21,6 +23,7 @@ struct idt_register {
 } __attribute__((packed));
 
 static struct idt_gate idt[256];
+extern void (*exception_stub_table[32])(void);
 
 static inline void outb(uint16_t port, uint8_t value)
 {
@@ -83,7 +86,7 @@ static void pic_remap(void)
     io_wait();
 
     outb(0xa1, 0xff);
-    outb(0x21, 0xed);
+    outb(0x21, 0xec);
 }
 
 void interrupts_init(void)
@@ -92,9 +95,11 @@ void interrupts_init(void)
 
     const uint16_t selector = current_code_selector();
     for (uint8_t vector = 0; vector < 32; ++vector) {
-        set_gate(vector, exception_halt_stub, selector);
+        set_gate(vector, exception_stub_table[vector], selector);
     }
+    set_gate(0x20, timer_irq_stub, selector);
     set_gate(0x21, keyboard_irq_stub, selector);
+    set_gate(0x2c, mouse_irq_stub, selector);
     set_gate(0x24, serial_irq_stub, selector);
 
     const struct idt_register idt_pointer = {
@@ -104,16 +109,55 @@ void interrupts_init(void)
     __asm__ volatile ("lidt %0" : : "m"(idt_pointer));
 
     pic_remap();
+    timer_init();
     if (!keyboard_init()) {
         serial_write("PS/2 keyboard did not acknowledge enable; keyboard input unavailable.\r\n");
+    }
+    if (mouse_init()) {
+        outb(0xa1, 0xef);
+        outb(0x21, 0xe8);
+        serial_write("PS/2 mouse initialized (IRQ12).\r\n");
+    } else {
+        serial_write("PS/2 mouse unavailable; pointer input disabled.\r\n");
     }
     serial_enable_interrupts();
     __asm__ volatile ("sti");
 }
 
-void kernel_exception_halt(void)
+static void serial_write_hex(uint64_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    char output[17];
+    uint8_t length = 0;
+    uint8_t started = 0;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        const uint8_t digit = (uint8_t)((value >> shift) & 0x0f);
+        if (digit != 0 || started || shift == 0) {
+            output[length++] = digits[digit];
+            started = 1;
+        }
+    }
+    output[length] = '\0';
+    serial_write(output);
+}
+
+void kernel_exception_report(uint64_t vector, uint64_t error_code,
+                             uint64_t instruction_pointer)
 {
     __asm__ volatile ("cli");
+    serial_write("\r\nFATAL: CPU exception vector=0x");
+    serial_write_hex(vector);
+    serial_write(" error=0x");
+    serial_write_hex(error_code);
+    serial_write(" rip=0x");
+    serial_write_hex(instruction_pointer);
+    if (vector == 14) {
+        uint64_t fault_address;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+        serial_write(" cr2=0x");
+        serial_write_hex(fault_address);
+    }
+    serial_write("\r\nSystem halted.\r\n");
     for (;;) {
         __asm__ volatile ("hlt");
     }
