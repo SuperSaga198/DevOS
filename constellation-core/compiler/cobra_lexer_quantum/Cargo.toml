@@ -1,9 +1,0 @@
-[package]
-name = "cobra-lexer-quantum"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[lib]
-name = "cobra_lexer_quantum"
-path = "src/lib.rs"

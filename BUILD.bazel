@@ -1,7 +1,0 @@
-# The initial compiler is built with Cargo. This target documents the planned
-# Bazel boundary without pretending the distributed build is implemented yet.
-filegroup(
-    name = "cobra_sources",
-    srcs = glob(["constellation-core/**/*.rs", "quantum-runtimes/**/*.rs"]),
-    visibility = ["//visibility:public"],
-)

@@ -1,7 +1,0 @@
-let total = 0;
-let step = 1;
-while step <= 5 {
-    let total = total + step;
-    print("step", step, "total", total);
-    let step = step + 1;
-}

@@ -1,3 +1,0 @@
-# Placeholder federation workspace. Bazel rules will mirror Cargo packages as
-# the compiler grows; Cargo remains the source of truth for this first slice.
-workspace(name = "cobra_infinite")

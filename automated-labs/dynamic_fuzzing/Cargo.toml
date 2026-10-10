@@ -1,9 +1,0 @@
-[package]
-name = "cobra-dynamic-fuzzing"
-version.workspace = true
-edition.workspace = true
-publish = false
-
-[dependencies]
-cobra-lexer-quantum.workspace = true
-cobra-parser-ast.workspace = true
