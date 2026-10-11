@@ -46,16 +46,106 @@ static size_t desktop_file_item_count;
 static char desktop_file_preview[DESKTOP_FILE_PREVIEW_MAX];
 static char desktop_username[32] = "developer";
 static char desktop_hostname[32] = "devos";
+static struct desktop_runtime_status desktop_status;
+
+#define DESKTOP_SURFACE 0xf7f8fcu
+#define DESKTOP_TEXT 0x172033u
+#define DESKTOP_MUTED 0x68758bu
+#define DESKTOP_ACCENT 0x6c8cffu
+#define DESKTOP_TASKBAR 0x111827u
+#define DESKTOP_ANIMATION_STEPS 8u
+
+struct desktop_wallpaper {
+    const char *name;
+    uint32_t top;
+    uint32_t bottom;
+    uint32_t motif;
+    uint32_t motif_light;
+    uint32_t accent;
+};
+
+static const struct desktop_wallpaper desktop_wallpapers[] = {
+    { "DEEP BLUE", 0x101827u, 0x1e3a5fu, 0x203e63u, 0x24466cu, 0x6c8cffu },
+    { "AURORA", 0x102422u, 0x176b69u, 0x1b605bu, 0x21827au, 0x67d6b4u },
+    { "SUNSET", 0x281b31u, 0x703e56u, 0x633e66u, 0x81506fu, 0xff9b73u },
+    { "GRAPHITE", 0x171a21u, 0x424958u, 0x363e4cu, 0x4d5767u, 0xa9b8d0u },
+};
+#define DESKTOP_WALLPAPER_COUNT \
+    (sizeof(desktop_wallpapers) / sizeof(desktop_wallpapers[0]))
+
+enum desktop_animation_kind {
+    DESKTOP_ANIMATION_NONE,
+    DESKTOP_ANIMATION_MENU_OPEN,
+    DESKTOP_ANIMATION_MENU_CLOSE,
+    DESKTOP_ANIMATION_WINDOW_OPEN,
+    DESKTOP_ANIMATION_WINDOW_CLOSE,
+};
+
+static enum desktop_animation_kind desktop_animation;
+static uint8_t desktop_animation_frame;
+static size_t desktop_animation_window;
+static uint8_t desktop_menu_visible;
+static uint8_t desktop_has_drawn;
+static struct desktop_window_slot desktop_closing_window;
+static uint8_t desktop_closing_window_visible;
+static size_t desktop_selected_wallpaper;
+static uint8_t desktop_motion_enabled = 1;
+
+static void desktop_animation_start(enum desktop_animation_kind kind)
+{
+    if (!desktop_motion_enabled) {
+        desktop_animation = DESKTOP_ANIMATION_NONE;
+        desktop_animation_frame = 0;
+        if (kind == DESKTOP_ANIMATION_MENU_CLOSE) {
+            desktop_menu_visible = 0;
+        } else if (kind == DESKTOP_ANIMATION_WINDOW_CLOSE) {
+            desktop_closing_window_visible = 0;
+        }
+        return;
+    }
+    desktop_animation = kind;
+    desktop_animation_frame = 0;
+}
+
+size_t desktop_wallpaper_index(void)
+{
+    return desktop_selected_wallpaper;
+}
+
+int desktop_animations_enabled(void)
+{
+    return desktop_motion_enabled != 0;
+}
 
 static const char *desktop_window_lookup_name(const char *name)
 {
     if (name == NULL) {
         return NULL;
     }
+
     while (*name == ' ' || *name == '\t') {
         ++name;
     }
     return *name == '\0' ? NULL : name;
+}
+
+static void desktop_format_uint(char *output, size_t capacity, uint64_t value)
+{
+    if (output == NULL || capacity == 0) {
+        return;
+    }
+    char digits[24];
+    size_t length = 0;
+    do {
+        digits[length++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0 && length < sizeof(digits));
+
+    size_t output_index = 0;
+    while (length != 0 && output_index + 1 < capacity) {
+        output[output_index++] = digits[--length];
+    }
+    output[output_index] = '\0';
 }
 
 static char desktop_upper_char(char value)
@@ -123,6 +213,14 @@ void desktop_set_identity(const char *username, const char *hostname)
 {
     desktop_copy_string(desktop_username, sizeof(desktop_username), username);
     desktop_copy_string(desktop_hostname, sizeof(desktop_hostname), hostname);
+}
+
+void desktop_set_runtime_status(
+    const struct desktop_runtime_status *status)
+{
+    if (status != NULL) {
+        desktop_status = *status;
+    }
 }
 
 void framebuffer_setup_draw(uint8_t state, const char *input,
@@ -199,28 +297,28 @@ static int desktop_window_find_slot(const char *name, size_t *index)
     return 0;
 }
 
-static void desktop_window_render_slot(size_t slot_index)
+static void desktop_window_render_slot_content(struct desktop_window_slot *slot)
 {
-    if (slot_index >= DESKTOP_WINDOW_MAX || !desktop_windows[slot_index].open) {
-        return;
-    }
+    framebuffer_rect(slot->x - 2, slot->y - 2, slot->width + 4,
+                     slot->height + 4, slot->focused ? 0x6c8cff : 0x344158);
+    framebuffer_rect(slot->x, slot->y, slot->width, slot->height,
+                     DESKTOP_SURFACE);
+    framebuffer_rect(slot->x, slot->y, slot->width, 34,
+                     slot->focused ? 0xffffff : 0xe9edf5);
+    framebuffer_rect(slot->x + 12, slot->y + 11, 12, 12,
+                     slot->focused ? 0xe45b67 : 0xb7c0d0);
+    framebuffer_rect(slot->x + 15, slot->y + 14, 6, 6, 0xffffff);
+    framebuffer_text(slot->x + 34, slot->y + 12, slot->name,
+                     DESKTOP_TEXT,
+                     slot->focused ? 0xffffff : 0xe9edf5, 1);
 
-    struct desktop_window_slot *slot = &desktop_windows[slot_index];
-    framebuffer_rect(slot->x, slot->y, slot->width, slot->height, 0xf3f4f8);
-    framebuffer_rect(slot->x, slot->y, slot->width, 28, slot->accent);
-    framebuffer_rect(slot->x + 8, slot->y + 8, 12, 12, 0xff5f57);
-    framebuffer_rect(slot->x + 28, slot->y + 8, 12, 12, 0xfebb2e);
-    framebuffer_rect(slot->x + 48, slot->y + 8, 12, 12, 0x28c840);
-    framebuffer_text(slot->x + 88, slot->y + 8, slot->name,
-                     0xfafcff, slot->accent, 1);
-
-    framebuffer_rect(slot->x + 12, slot->y + 38, slot->width - 24,
-                     slot->height - 46, 0xffffff);
+    framebuffer_rect(slot->x + 1, slot->y + 35, slot->width - 2,
+                     slot->height - 36, DESKTOP_SURFACE);
     if (desktop_window_name_matches(slot->name, "FILES")) {
         framebuffer_text(slot->x + 20, slot->y + 46, desktop_file_path,
-                         0x34445d, 0xffffff, 1);
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
         framebuffer_text(slot->x + 20, slot->y + 64, "[..]",
-                         0x365e9d, 0xffffff, 1);
+                         DESKTOP_ACCENT, DESKTOP_SURFACE, 1);
         for (size_t index = 0; index < desktop_file_item_count; ++index) {
             const uint64_t row_y = slot->y + 82 + index * 16;
             char label[DESKTOP_FILE_NAME_MAX + 5];
@@ -237,11 +335,13 @@ static void desktop_window_render_slot(size_t slot_index)
                 label[out++] = desktop_file_items[index].name[name_index++];
             }
             label[out] = '\0';
-            framebuffer_text(slot->x + 20, row_y, label, 0x26374c,
-                             0xffffff, 1);
+            framebuffer_rect(slot->x + 16, row_y - 2, slot->width - 32,
+                             14, index % 2 == 0 ? 0xf0f3f9 : 0xffffff);
+            framebuffer_text(slot->x + 20, row_y, label, DESKTOP_TEXT,
+                             index % 2 == 0 ? 0xf0f3f9 : 0xffffff, 1);
         }
         framebuffer_rect(slot->x + 18, slot->y + slot->height - 52,
-                         slot->width - 36, 1, 0xe7ebf2);
+                         slot->width - 36, 1, 0xdce2ed);
         char preview_lines[DESKTOP_FILE_PREVIEW_MAX + 4];
         const char *preview = desktop_file_preview[0] != '\0'
                                   ? desktop_file_preview
@@ -265,56 +365,209 @@ static void desktop_window_render_slot(size_t slot_index)
         }
         preview_lines[output_index] = '\0';
         framebuffer_text(slot->x + 20, slot->y + slot->height - 42,
-                         preview_lines, 0x5f6d7b, 0xffffff, 1);
+                         preview_lines, DESKTOP_MUTED, DESKTOP_SURFACE, 1);
         return;
     }
     if (desktop_window_name_matches(slot->name, "NETWORK")) {
-        framebuffer_text(slot->x + 20, slot->y + 54, "NIC OFFLINE",
-                         0xb45309, 0xffffff, 1);
-        framebuffer_text(slot->x + 20, slot->y + 78, "Packet core only",
-                         0x5f6d7b, 0xffffff, 1);
+        framebuffer_text(slot->x + 20, slot->y + 54,
+                         desktop_status.network_ready
+                             ? "e1000 online" : "No supported NIC",
+                         desktop_status.network_ready ? 0x18794e : 0xb45309,
+                         DESKTOP_SURFACE, 1);
+        framebuffer_text(slot->x + 20, slot->y + 72,
+                         "IPv4 10.0.2.15 / gateway .2",
+                         DESKTOP_MUTED, DESKTOP_SURFACE, 1);
+        char counters[32];
+        desktop_format_uint(counters, sizeof(counters),
+                            desktop_status.udp_echoes);
+        framebuffer_text(slot->x + 20, slot->y + 90, "UDP echo replies:",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        framebuffer_text(slot->x + 130, slot->y + 90, counters,
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        desktop_format_uint(counters, sizeof(counters),
+                            desktop_status.tcp_echoes);
+        framebuffer_text(slot->x + 20, slot->y + 108, "TCP echo replies:",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        framebuffer_text(slot->x + 130, slot->y + 108, counters,
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        framebuffer_rect(slot->x + 18, slot->y + 128,
+                         slot->width - 36, 24, DESKTOP_ACCENT);
+        framebuffer_text(slot->x + 28, slot->y + 136,
+                         desktop_status.gateway_reachable
+                             ? "GATEWAY REACHABLE" : "PING GATEWAY",
+                         0xffffff, DESKTOP_ACCENT, 1);
         return;
     }
     if (desktop_window_name_matches(slot->name, "AUDIO")) {
         framebuffer_text(slot->x + 20, slot->y + 54, "PC SPEAKER OUTPUT",
-                         0x26374c, 0xffffff, 1);
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
         framebuffer_rect(slot->x + 20, slot->y + 78, slot->width - 40, 34,
-                         0x2f8cff);
+                         DESKTOP_ACCENT);
         framebuffer_text(slot->x + 34, slot->y + 91, "PLAY TEST TONE",
-                         0xffffff, 0x2f8cff, 1);
+                         0xffffff, DESKTOP_ACCENT, 1);
         framebuffer_text(slot->x + 20, slot->y + 126,
                          "880 Hz - PC speaker, no PCM mixer",
-                         0x5f6d7b, 0xffffff, 1);
+                         DESKTOP_MUTED, DESKTOP_SURFACE, 1);
         return;
     }
     if (desktop_window_name_matches(slot->name, "SETTINGS")) {
-        framebuffer_text(slot->x + 20, slot->y + 54, "SYSTEM SETTINGS",
-                         0x26374c, 0xffffff, 1);
-        framebuffer_text(slot->x + 20, slot->y + 76, "User:",
-                         0x5f6d7b, 0xffffff, 1);
-        framebuffer_text(slot->x + 62, slot->y + 76, desktop_username,
-                         0x26374c, 0xffffff, 1);
-        framebuffer_text(slot->x + 20, slot->y + 94, "Host:",
-                         0x5f6d7b, 0xffffff, 1);
-        framebuffer_text(slot->x + 62, slot->y + 94, desktop_hostname,
-                         0x26374c, 0xffffff, 1);
-        framebuffer_text(slot->x + 20, slot->y + 126, "Network/audio status:",
-                         0x5f6d7b, 0xffffff, 1);
-        framebuffer_text(slot->x + 20, slot->y + 144,
-                         "See terminal: sysinfo",
-                         0x26374c, 0xffffff, 1);
+        const uint64_t sidebar_width = slot->width > 300 ? 124 : 88;
+        const uint64_t main_x = slot->x + sidebar_width + 24;
+        const uint64_t main_width =
+            slot->width > sidebar_width + 44
+                ? slot->width - sidebar_width - 44 : 120;
+        framebuffer_rect(slot->x + 1, slot->y + 35, sidebar_width,
+                         slot->height - 36, 0xedf1f7);
+        framebuffer_text(slot->x + 16, slot->y + 50, "SETTINGS",
+                         DESKTOP_TEXT, 0xedf1f7, 1);
+        framebuffer_rect(slot->x + 12, slot->y + 68, sidebar_width - 20,
+                         28, 0xdde7fb);
+        framebuffer_text(slot->x + 18, slot->y + 78, "PROFILE",
+                         DESKTOP_ACCENT, 0xdde7fb, 1);
+        framebuffer_text(slot->x + 18, slot->y + 110, "PERSONALIZE",
+                         DESKTOP_MUTED, 0xedf1f7, 1);
+        framebuffer_text(slot->x + 18, slot->y + 142, "SERVICES",
+                         DESKTOP_MUTED, 0xedf1f7, 1);
+        framebuffer_text(slot->x + 18, slot->y + 174, "MOTION",
+                         DESKTOP_MUTED, 0xedf1f7, 1);
+
+        framebuffer_text(main_x, slot->y + 50, "YOUR DEVOS",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        framebuffer_text(main_x, slot->y + 68, desktop_username,
+                         DESKTOP_ACCENT, DESKTOP_SURFACE, 1);
+        framebuffer_text(main_x + main_width / 2, slot->y + 68,
+                         desktop_hostname, DESKTOP_MUTED,
+                         DESKTOP_SURFACE, 1);
+        framebuffer_rect(main_x, slot->y + 86, main_width, 1, 0xdce2ed);
+        framebuffer_text(main_x, slot->y + 96, "WALLPAPER",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+
+        const uint64_t tile_gap = 8;
+        const uint64_t tile_width =
+            main_width > 2 * tile_gap
+                ? (main_width - 2 * tile_gap) / DESKTOP_WALLPAPER_COUNT : 1;
+        for (size_t index = 0; index < DESKTOP_WALLPAPER_COUNT; ++index) {
+            const uint64_t tile_x =
+                main_x + index * (tile_width + tile_gap);
+            const struct desktop_wallpaper *wallpaper =
+                &desktop_wallpapers[index];
+            framebuffer_rect(tile_x, slot->y + 116, tile_width, 59,
+                             index == desktop_selected_wallpaper
+                                 ? DESKTOP_ACCENT : 0xdce2ed);
+            framebuffer_rect(tile_x + 2, slot->y + 118,
+                             tile_width > 4 ? tile_width - 4 : 1, 38,
+                             wallpaper->top);
+            framebuffer_rect(tile_x + 2, slot->y + 137,
+                             tile_width > 4 ? tile_width - 4 : 1, 19,
+                             wallpaper->bottom);
+            framebuffer_rect(tile_x + 2, slot->y + 153,
+                             tile_width > 4 ? tile_width - 4 : 1, 4,
+                             wallpaper->accent);
+            framebuffer_text(tile_x + 4, slot->y + 160, wallpaper->name,
+                             index == desktop_selected_wallpaper
+                                 ? 0xffffff : DESKTOP_TEXT,
+                             index == desktop_selected_wallpaper
+                                 ? DESKTOP_ACCENT : 0xdce2ed, 1);
+        }
+
+        framebuffer_text(main_x, slot->y + 187, "SYSTEM SERVICES",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        const uint64_t card_gap = 8;
+        const uint64_t card_width =
+            main_width > card_gap ? (main_width - card_gap) / 2 : 1;
+        const uint64_t card_height = slot->height > 330 ? 35 : 24;
+        const uint64_t card_y = slot->y + 204;
+        const char *service_names[4] = {
+            "STORAGE", "NETWORK", "AUDIO", "DESKTOP"
+        };
+        const char *service_states[4] = {
+            desktop_status.storage_ready ? "READY" : "RAM ONLY",
+            desktop_status.network_ready ? "ONLINE" : "OFFLINE",
+            desktop_status.audio_ready ? "PC SPEAKER" : "OFFLINE",
+            "RUNNING"
+        };
+        const uint8_t service_ready[4] = {
+            desktop_status.storage_ready,
+            desktop_status.network_ready,
+            desktop_status.audio_ready,
+            1
+        };
+        for (size_t index = 0; index < 4; ++index) {
+            const uint64_t column = index % 2;
+            const uint64_t row = index / 2;
+            const uint64_t card_x =
+                main_x + column * (card_width + card_gap);
+            const uint64_t y = card_y + row * (card_height + 5);
+            framebuffer_rect(card_x, y, card_width, card_height,
+                             0xf0f3f9);
+            framebuffer_rect(card_x, y, 3, card_height,
+                             service_ready[index] ? 0x34a77a : 0xd69a42);
+            framebuffer_text(card_x + 9, y + 4, service_names[index],
+                             DESKTOP_TEXT, 0xf0f3f9, 1);
+            if (card_height >= 30) {
+                framebuffer_text(card_x + 9, y + 19,
+                                 service_states[index],
+                                 service_ready[index] ? 0x18794e : 0xb45309,
+                                 0xf0f3f9, 1);
+            }
+        }
+
+        const uint64_t motion_y =
+            slot->height > 300 ? slot->y + slot->height - 31
+                               : slot->y + 260;
+        framebuffer_rect(main_x, motion_y, main_width, 1, 0xdce2ed);
+        framebuffer_text(main_x, motion_y + 8,
+                         desktop_motion_enabled
+                             ? "MOTION  ON"
+                             : "MOTION  OFF",
+                         DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+        framebuffer_rect(main_x + main_width - 54, motion_y + 5,
+                         48, 17,
+                         desktop_motion_enabled ? DESKTOP_ACCENT : 0x9aa5b5);
+        framebuffer_text(main_x + main_width - 49, motion_y + 10,
+                         desktop_motion_enabled ? "ON" : "OFF",
+                         0xffffff,
+                         desktop_motion_enabled ? DESKTOP_ACCENT : 0x9aa5b5,
+                         1);
         return;
     }
     if (slot->focused) {
-        framebuffer_text(slot->x + 20, slot->y + 54, "focused", 0x1d4ed8,
-                         0xffffff, 1);
+        framebuffer_text(slot->x + 20, slot->y + 54, "focused", DESKTOP_ACCENT,
+                         DESKTOP_SURFACE, 1);
     } else {
-        framebuffer_text(slot->x + 20, slot->y + 54, "ready", 0x1e7d5a,
-                         0xffffff, 1);
+        framebuffer_text(slot->x + 20, slot->y + 54, "ready", 0x18794e,
+                         DESKTOP_SURFACE, 1);
     }
     framebuffer_rect(slot->x + 20, slot->y + 86, slot->width - 40, 3, 0xe7ebf2);
-    framebuffer_text(slot->x + 20, slot->y + 98, "desktop", 0x5f6d7b,
-                     0xffffff, 1);
+    framebuffer_text(slot->x + 20, slot->y + 98, "desktop", DESKTOP_MUTED,
+                 DESKTOP_SURFACE, 1);
+}
+
+static uint64_t desktop_window_animation_offset(void)
+{
+    const uint64_t remaining =
+        DESKTOP_ANIMATION_STEPS - desktop_animation_frame;
+    return 20 * remaining * remaining /
+           (DESKTOP_ANIMATION_STEPS * DESKTOP_ANIMATION_STEPS);
+}
+
+static uint64_t desktop_window_close_offset(void)
+{
+    return 20 - desktop_window_animation_offset();
+}
+
+static void desktop_window_render_slot(size_t slot_index)
+{
+    if (slot_index >= DESKTOP_WINDOW_MAX || !desktop_windows[slot_index].open) {
+        return;
+    }
+
+    struct desktop_window_slot visual = desktop_windows[slot_index];
+    if (desktop_animation == DESKTOP_ANIMATION_WINDOW_OPEN &&
+        slot_index == desktop_animation_window) {
+        visual.y += desktop_window_animation_offset();
+    }
+    desktop_window_render_slot_content(&visual);
 }
 
 static void desktop_window_render_all(void)
@@ -329,31 +582,52 @@ static void desktop_window_render_all(void)
             desktop_window_render_slot(index);
         }
     }
+    if (desktop_animation == DESKTOP_ANIMATION_WINDOW_CLOSE &&
+        desktop_closing_window_visible) {
+        struct desktop_window_slot visual = desktop_closing_window;
+        visual.y += desktop_window_close_offset();
+        desktop_window_render_slot_content(&visual);
+    }
 }
 
 static void desktop_start_menu_draw(void)
 {
-    if (!desktop_start_menu_open || active_framebuffer == NULL) {
+    if (!desktop_menu_visible || active_framebuffer == NULL) {
         return;
     }
 
     const uint64_t bottom = active_framebuffer->height > 54
                                 ? active_framebuffer->height - 54 : 0;
     const uint64_t menu_height = bottom > 302 ? 302 : bottom;
-    framebuffer_rect(12, bottom - menu_height, 220, menu_height, 0xf3f4f8);
-    framebuffer_rect(12, bottom - menu_height, 220, 30, 0x20334f);
-    framebuffer_text(24, bottom - menu_height + 10, "DEVOS APPS",
-                     0xffffff, 0x20334f, 1);
-    framebuffer_text(28, bottom - menu_height + 52, "TERMINAL",
-                     0x26374c, 0xf3f4f8, 1);
-    framebuffer_text(28, bottom - menu_height + 94, "FILES",
-                     0x26374c, 0xf3f4f8, 1);
-    framebuffer_text(28, bottom - menu_height + 136, "NETWORK",
-                     0x26374c, 0xf3f4f8, 1);
-    framebuffer_text(28, bottom - menu_height + 178, "SETTINGS",
-                     0x26374c, 0xf3f4f8, 1);
-    framebuffer_text(28, bottom - menu_height + 220, "AUDIO",
-                     0x26374c, 0xf3f4f8, 1);
+    const uint64_t menu_top = bottom - menu_height;
+    uint64_t offset = desktop_window_animation_offset();
+    if (desktop_animation == DESKTOP_ANIMATION_MENU_CLOSE) {
+        offset = 20 - offset;
+    } else if (desktop_animation != DESKTOP_ANIMATION_MENU_OPEN) {
+        offset = 0;
+    }
+    const uint64_t y = menu_top + offset;
+    framebuffer_rect(8, y - 4, 228, menu_height + 4,
+                     0x0c1220);
+    framebuffer_rect(12, y, 220, menu_height,
+                     DESKTOP_SURFACE);
+    framebuffer_rect(12, y, 220, 36, 0xe9edf5);
+    framebuffer_rect(12, y, 3, menu_height, DESKTOP_ACCENT);
+    framebuffer_text(26, y + 11, "DEVOS",
+                     DESKTOP_TEXT, 0xe9edf5, 1);
+    framebuffer_text(28, y + 52, "TERMINAL",
+                     DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+    framebuffer_text(28, y + 94, "FILES",
+                     DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+    framebuffer_text(28, y + 136, "NETWORK",
+                     DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+    framebuffer_text(28, y + 178, "SETTINGS",
+                     DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+    framebuffer_text(28, y + 220, "AUDIO",
+                     DESKTOP_TEXT, DESKTOP_SURFACE, 1);
+    framebuffer_rect(28, y + 262, 184, 1, 0xdce2ed);
+    framebuffer_text(28, y + 276, desktop_username,
+                     DESKTOP_MUTED, DESKTOP_SURFACE, 1);
 }
 
 static const char *const cursor_shape[CURSOR_HEIGHT] = {
@@ -643,8 +917,13 @@ static void desktop_draw_start_button(uint64_t width)
                                   ? active_framebuffer->height - 42 : 0;
     const uint64_t button_width = width > 90 ? 90 : width;
     const uint64_t button_height = 28;
-    framebuffer_rect(button_x, button_y, button_width, button_height, 0x2f8cff);
-    framebuffer_text(button_x + 12, button_y + 7, "START", 0xffffff, 0x2f8cff, 1);
+    framebuffer_rect(button_x, button_y, button_width, button_height, 0x202b3e);
+    framebuffer_rect(button_x + 13, button_y + 8, 5, 5, 0x72a1ff);
+    framebuffer_rect(button_x + 20, button_y + 8, 5, 5, 0x72a1ff);
+    framebuffer_rect(button_x + 13, button_y + 15, 5, 5, 0x72a1ff);
+    framebuffer_rect(button_x + 20, button_y + 15, 5, 5, 0x72a1ff);
+    framebuffer_text(button_x + 34, button_y + 9, "START",
+                     0xe5ebf5, 0x202b3e, 1);
 }
 
 static void desktop_draw_memory_text(uint64_t usable_memory_mib)
@@ -669,7 +948,7 @@ static void desktop_draw_memory_text(uint64_t usable_memory_mib)
         memory_text[output] = '\0';
     }
     framebuffer_text(active_framebuffer->width > 480 ? active_framebuffer->width - 220 : 12,
-                     56, memory_text, 0xe2f1ff, 0x1a4d7a, 1);
+                     38, memory_text, 0xc5d0e2, 0x18243a, 1);
 }
 
 void desktop_window_init(void)
@@ -677,6 +956,13 @@ void desktop_window_init(void)
     memset(desktop_windows, 0, sizeof(desktop_windows));
     desktop_initialized = 1;
     desktop_start_menu_open = 0;
+    desktop_menu_visible = 0;
+    desktop_animation = DESKTOP_ANIMATION_NONE;
+    desktop_animation_frame = 0;
+    desktop_has_drawn = 0;
+    desktop_closing_window_visible = 0;
+    desktop_selected_wallpaper = 0;
+    desktop_motion_enabled = 1;
     desktop_previous_buttons = 0;
     desktop_drag_slot = -1;
 
@@ -739,6 +1025,13 @@ int desktop_window_open(const char *name, uint64_t x, uint64_t y, uint64_t width
                     desktop_windows[other].focused = 0;
                 }
             }
+            if (desktop_has_drawn) {
+                desktop_start_menu_open = 0;
+                desktop_menu_visible = 0;
+                desktop_closing_window_visible = 0;
+                desktop_animation_window = index;
+                desktop_animation_start(DESKTOP_ANIMATION_WINDOW_OPEN);
+            }
             return 1;
         }
     }
@@ -756,6 +1049,13 @@ int desktop_window_close(const char *name)
     for (size_t index = 0; index < DESKTOP_WINDOW_MAX; ++index) {
         if (desktop_windows[index].open &&
             desktop_window_name_matches(desktop_windows[index].name, safe_name)) {
+            if (desktop_has_drawn) {
+                desktop_closing_window = desktop_windows[index];
+                desktop_closing_window_visible = 1;
+                desktop_start_menu_open = 0;
+                desktop_menu_visible = 0;
+                desktop_animation_start(DESKTOP_ANIMATION_WINDOW_CLOSE);
+            }
             memset(&desktop_windows[index], 0, sizeof(desktop_windows[index]));
             return 1;
         }
@@ -832,6 +1132,23 @@ static int desktop_open_app(const char *name)
         return 1;
     }
 
+    if (desktop_window_name_matches(name, "SETTINGS") &&
+        active_framebuffer->width >= 240 &&
+        active_framebuffer->height >= 180) {
+        const uint64_t width = active_framebuffer->width > 64
+                                   ? active_framebuffer->width - 64
+                                   : active_framebuffer->width;
+        const uint64_t height = active_framebuffer->height > 110
+                                    ? active_framebuffer->height - 110
+                                    : active_framebuffer->height;
+        const uint64_t x = (active_framebuffer->width - width) / 2;
+        const uint64_t y = 42;
+        if (width >= 120 && height >= 90) {
+            return desktop_window_open("SETTINGS", x, y, width, height,
+                                       0x815ac0);
+        }
+    }
+
     const size_t count = desktop_window_count();
     const uint64_t x = 100 + (count % 4) * 32;
     const uint64_t y = 70 + (count % 4) * 28;
@@ -892,6 +1209,8 @@ int desktop_pointer_event(uint64_t x, uint64_t y, uint8_t buttons)
         const uint64_t row_y = y - menu_top;
         if (row_y >= 36 && row_y < 78) {
             desktop_start_menu_open = 0;
+            desktop_menu_visible = 0;
+            desktop_animation = DESKTOP_ANIMATION_NONE;
             return DESKTOP_ACTION_OPEN_TERMINAL;
         }
         const char *app = NULL;
@@ -905,6 +1224,8 @@ int desktop_pointer_event(uint64_t x, uint64_t y, uint8_t buttons)
             app = "AUDIO";
         }
         desktop_start_menu_open = 0;
+        desktop_menu_visible = 0;
+        desktop_animation = DESKTOP_ANIMATION_NONE;
         if (app != NULL) {
             desktop_open_app(app);
             return DESKTOP_ACTION_REDRAW;
@@ -915,25 +1236,38 @@ int desktop_pointer_event(uint64_t x, uint64_t y, uint8_t buttons)
     if (y >= taskbar_top) {
         if (x >= 16 && x < 106 && y < taskbar_top + 42) {
             desktop_start_menu_open = !desktop_start_menu_open;
+            desktop_menu_visible = 1;
+            desktop_animation_start(desktop_start_menu_open
+                ? DESKTOP_ANIMATION_MENU_OPEN : DESKTOP_ANIMATION_MENU_CLOSE);
             return DESKTOP_ACTION_REDRAW;
         }
         if (x >= 120 && x < 192) {
             desktop_start_menu_open = 0;
+            desktop_menu_visible = 0;
+            desktop_animation = DESKTOP_ANIMATION_NONE;
             return DESKTOP_ACTION_OPEN_TERMINAL;
         }
         if (x >= 208 && x < 272) {
+            desktop_menu_visible = 0;
             desktop_open_app("FILES");
             return DESKTOP_ACTION_REDRAW;
         }
         if (x >= 286 && x < 358) {
+            desktop_menu_visible = 0;
             desktop_open_app("SETTINGS");
             return DESKTOP_ACTION_REDRAW;
         }
         desktop_start_menu_open = 0;
+        if (desktop_menu_visible) {
+            desktop_animation_start(DESKTOP_ANIMATION_MENU_CLOSE);
+        }
         return DESKTOP_ACTION_REDRAW;
     }
 
     desktop_start_menu_open = 0;
+    if (desktop_menu_visible) {
+        desktop_animation_start(DESKTOP_ANIMATION_MENU_CLOSE);
+    }
     for (size_t reverse = DESKTOP_WINDOW_MAX; reverse > 0; --reverse) {
         const size_t index = reverse - 1;
         struct desktop_window_slot *slot = &desktop_windows[index];
@@ -963,6 +1297,52 @@ int desktop_pointer_event(uint64_t x, uint64_t y, uint8_t buttons)
             y >= slot->y + 78 && y < slot->y + 112) {
             return DESKTOP_ACTION_AUDIO_TEST_TONE;
         }
+        if (desktop_window_name_matches(slot->name, "NETWORK") &&
+            x >= slot->x + 12 && x < slot->x + slot->width - 12 &&
+            y >= slot->y + 128 && y < slot->y + 152) {
+            return desktop_status.gateway_reachable
+                       ? DESKTOP_ACTION_REDRAW : DESKTOP_ACTION_NETWORK_PING;
+        }
+        if (desktop_window_name_matches(slot->name, "SETTINGS")) {
+            const uint64_t sidebar_width =
+                slot->width > 300 ? 124 : 88;
+            const uint64_t main_x = slot->x + sidebar_width + 24;
+            const uint64_t main_width =
+                slot->width > sidebar_width + 44
+                    ? slot->width - sidebar_width - 44 : 120;
+            if (y >= slot->y + 114 && y < slot->y + 179 &&
+                x >= main_x &&
+                x < main_x + main_width) {
+                const uint64_t tile_gap = 8;
+                const uint64_t tile_width =
+                    main_width > 2 * tile_gap
+                        ? (main_width - 2 * tile_gap) /
+                              DESKTOP_WALLPAPER_COUNT
+                        : 1;
+                const uint64_t offset = x - main_x;
+                const uint64_t tile_stride = tile_width + tile_gap;
+                const size_t wallpaper = (size_t)(offset / tile_stride);
+                if (wallpaper < DESKTOP_WALLPAPER_COUNT &&
+                    offset % tile_stride < tile_width) {
+                    desktop_selected_wallpaper = wallpaper;
+                    return DESKTOP_ACTION_WALLPAPER_BASE + (int)wallpaper;
+                }
+            }
+            const uint64_t motion_y =
+                slot->height > 300 ? slot->y + slot->height - 31
+                                   : slot->y + 260;
+            if (y >= motion_y + 4 && y < motion_y + 24 &&
+                x >= main_x && x < main_x + main_width) {
+                desktop_motion_enabled = !desktop_motion_enabled;
+                if (!desktop_motion_enabled) {
+                    desktop_animation = DESKTOP_ANIMATION_NONE;
+                    desktop_animation_frame = 0;
+                    desktop_menu_visible = desktop_start_menu_open;
+                    desktop_closing_window_visible = 0;
+                }
+                return DESKTOP_ACTION_ANIMATION_TOGGLE;
+            }
+        }
         if (y < slot->y + 28) {
             if (x < slot->x + 24) {
                 desktop_window_close(slot->name);
@@ -977,6 +1357,26 @@ int desktop_pointer_event(uint64_t x, uint64_t y, uint8_t buttons)
     return DESKTOP_ACTION_REDRAW;
 }
 
+int desktop_animation_step(void)
+{
+    if (desktop_animation == DESKTOP_ANIMATION_NONE) {
+        return 0;
+    }
+    if (desktop_animation_frame < DESKTOP_ANIMATION_STEPS) {
+        ++desktop_animation_frame;
+    }
+    if (desktop_animation_frame == DESKTOP_ANIMATION_STEPS) {
+        if (desktop_animation == DESKTOP_ANIMATION_MENU_CLOSE) {
+            desktop_menu_visible = 0;
+        } else if (desktop_animation == DESKTOP_ANIMATION_WINDOW_CLOSE) {
+            desktop_closing_window_visible = 0;
+        }
+        desktop_animation = DESKTOP_ANIMATION_NONE;
+        desktop_animation_frame = 0;
+    }
+    return 1;
+}
+
 void desktop_draw(uint64_t usable_memory_mib)
 {
     if (active_framebuffer == NULL) {
@@ -985,9 +1385,36 @@ void desktop_draw(uint64_t usable_memory_mib)
 
     const uint64_t width = active_framebuffer->width;
     const uint64_t height = active_framebuffer->height;
+    const struct desktop_wallpaper *wallpaper =
+        &desktop_wallpapers[desktop_selected_wallpaper];
 
-    framebuffer_clear(0x1a4d7a);
-    framebuffer_rect(0, 0, width, 42, 0x0f1d2d);
+    framebuffer_clear(wallpaper->top);
+    const uint64_t gradient_steps = 24;
+    for (uint64_t step = 0; step < gradient_steps; ++step) {
+        const uint64_t y0 = height * step / gradient_steps;
+        const uint64_t y1 = height * (step + 1) / gradient_steps;
+        const uint32_t mix = (uint32_t)(step * 255 / gradient_steps);
+        uint32_t color = 0;
+        for (uint8_t shift = 0; shift <= 16; shift += 8) {
+            const uint32_t start = (wallpaper->top >> shift) & 0xff;
+            const uint32_t end = (wallpaper->bottom >> shift) & 0xff;
+            const uint32_t component =
+                (start * (255 - mix) + end * mix) / 255;
+            color |= component << shift;
+        }
+        framebuffer_rect(0, y0, width, y1 - y0, color);
+    }
+
+    const uint64_t motif_x = width * 3 / 5;
+    const uint64_t motif_y = height / 5;
+    const uint64_t motif_height =
+        height > motif_y + 54 ? height - motif_y - 54 : 0;
+    framebuffer_rect(motif_x, motif_y, width - motif_x,
+                     motif_height, wallpaper->motif);
+    framebuffer_rect(motif_x + (width - motif_x) / 4, motif_y,
+                     (width - motif_x) * 3 / 4,
+                     motif_height, wallpaper->motif_light);
+    framebuffer_rect(0, 0, width, 2, wallpaper->accent);
 
     if (!desktop_initialized) {
         desktop_window_init();
@@ -996,31 +1423,37 @@ void desktop_draw(uint64_t usable_memory_mib)
     desktop_window_render_all();
 
     const uint64_t taskbar_height = 54;
-    framebuffer_rect(0, height - taskbar_height, width, taskbar_height, 0x111d2f);
+    framebuffer_rect(0, height - taskbar_height, width, taskbar_height,
+                     DESKTOP_TASKBAR);
+    framebuffer_rect(0, height - taskbar_height, width, 1, 0x344158);
     desktop_draw_start_button(width);
 
-    framebuffer_rect(width > 200 ? width - 160 : 0, height - 42, 120, 26, 0x1e2a3e);
-    framebuffer_text(width > 200 ? width - 150 : 12, height - 32,
-                     "10:42 AM", 0xeaf0ff, 0x1e2a3e, 1);
+    const uint64_t status_x = width > 200 ? width - 104 : 0;
+    framebuffer_text(status_x, height - 32, "READY",
+                     0xc5d0e2, DESKTOP_TASKBAR, 1);
 
     const uint64_t app_x = 120;
     const uint64_t app_y = height - 38;
-    framebuffer_rect(app_x, app_y, 72, 20, 0x213b5b);
-    framebuffer_text(app_x + 12, app_y + 4, "TERMINAL", 0xdfe7ff, 0x213b5b, 1);
-    framebuffer_rect(app_x + 88, app_y, 64, 20, 0x213b5b);
-    framebuffer_text(app_x + 100, app_y + 4, "FILES", 0xdfe7ff, 0x213b5b, 1);
-    framebuffer_rect(app_x + 166, app_y, 72, 20, 0x213b5b);
-    framebuffer_text(app_x + 180, app_y + 4, "SETUP", 0xdfe7ff, 0x213b5b, 1);
+    framebuffer_rect(app_x, app_y, 72, 24, 0x202b3e);
+    framebuffer_rect(app_x + 4, app_y + 4, 2, 16, DESKTOP_ACCENT);
+    framebuffer_text(app_x + 12, app_y + 9, "TERMINAL",
+                     0xe5ebf5, 0x202b3e, 1);
+    framebuffer_rect(app_x + 88, app_y, 64, 24, 0x202b3e);
+    framebuffer_rect(app_x + 92, app_y + 4, 2, 16, 0x68c5a5);
+    framebuffer_text(app_x + 100, app_y + 9, "FILES",
+                     0xe5ebf5, 0x202b3e, 1);
+    framebuffer_rect(app_x + 166, app_y, 72, 24, 0x202b3e);
+    framebuffer_rect(app_x + 170, app_y + 4, 2, 16, 0xb898ff);
+    framebuffer_text(app_x + 174, app_y + 9, "SETTINGS",
+                     0xe5ebf5, 0x202b3e, 1);
 
-    framebuffer_text(18, 12, "DEVOS", 0x9ad6ff, 0x0f1d2d, 2);
+    framebuffer_text(18, 12, "DEVOS", 0xe8efff, wallpaper->top, 1);
     framebuffer_text(width > 400 ? width - 120 : 12, 12,
-                     "DESKTOP", 0xd6e7ff, 0x0f1d2d, 1);
-    framebuffer_text(18, 52, "Developer OS", 0xdce8ff, 0x1a4d7a, 1);
+                     "DEVELOPER DESKTOP", 0xd6e1f2,
+                     wallpaper->top, 1);
     desktop_draw_memory_text(usable_memory_mib);
     desktop_start_menu_draw();
-    framebuffer_text(18, 72, desktop_username, 0xffffff, 0x1a4d7a, 1);
-    framebuffer_text(18, 88, desktop_hostname, 0xdce8ff, 0x1a4d7a, 1);
-    framebuffer_text(18, height - 58, "Press T for terminal", 0xe8efff, 0x1a4d7a, 1);
+    desktop_has_drawn = 1;
 }
 
 static void terminal_render_line(uint16_t row)

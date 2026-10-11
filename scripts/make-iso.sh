@@ -9,6 +9,12 @@ archive_tmp="$build_dir/limine-binary.tar.gz.tmp.$$"
 limine_dir="$build_dir/limine-binary"
 iso_root="$build_dir/iso-root"
 iso_path="$build_dir/devos.iso"
+source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$root_dir" log -1 --format=%ct)}"
+
+if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+    printf 'error: SOURCE_DATE_EPOCH must be a Unix timestamp\n' >&2
+    exit 1
+fi
 
 trap 'rm -f "$archive_tmp"' EXIT
 
@@ -42,8 +48,15 @@ cp "$limine_dir/limine-bios-cd.bin" "$iso_root/boot/limine-bios-cd.bin"
 cp "$limine_dir/limine-uefi-cd.bin" "$iso_root/boot/limine-uefi-cd.bin"
 cp "$limine_dir/BOOTX64.EFI" "$iso_root/EFI/BOOT/BOOTX64.EFI"
 
+find "$iso_root" -exec touch -h -d "@$source_date_epoch" {} +
+iso_modification_date="$(
+    date -u -d "@$source_date_epoch" '+%Y%m%d%H%M%S00'
+)"
 xorriso -as mkisofs \
     -R -r -J \
+    --modification-date="$iso_modification_date" \
+    --set_all_file_dates "$iso_modification_date" \
+    --gpt_disk_guid 4445564f-532d-4f53-8000-000000000001 \
     -b boot/limine-bios-cd.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
     -apm-block-size 2048 \

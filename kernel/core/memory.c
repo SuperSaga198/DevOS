@@ -12,6 +12,7 @@
 #define PAGE_WRITE_THROUGH 0x008ULL
 #define PAGE_CACHE_DISABLE 0x010ULL
 #define PAGE_USER 0x004ULL
+#define PAGE_NO_EXECUTE (1ULL << 63)
 #define PAGE_ADDRESS_MASK 0x000ffffffffff000ULL
 
 static uint64_t managed_bitmap[BITMAP_WORDS];
@@ -19,6 +20,7 @@ static uint64_t allocated_bitmap[BITMAP_WORDS];
 static uint64_t direct_map_offset;
 static struct memory_stats allocator_stats;
 static int allocator_ready;
+static int nx_enabled;
 
 struct heap_header {
     uint64_t magic;
@@ -365,11 +367,44 @@ int memory_destroy_user_address_space(uint64_t root_physical)
     return page_free(root_physical);
 }
 
+int memory_enable_nx(void)
+{
+    if (nx_enabled) {
+        return 1;
+    }
+    uint32_t maximum_extended_leaf;
+    uint32_t unused_b, unused_c, unused_d;
+    __asm__ volatile ("cpuid"
+                      : "=a"(maximum_extended_leaf), "=b"(unused_b),
+                        "=c"(unused_c), "=d"(unused_d)
+                      : "a"(0x80000000u), "c"(0));
+    if (maximum_extended_leaf < 0x80000001u) {
+        return 0;
+    }
+    uint32_t features;
+    uint32_t unused_feature_a, unused_feature_b, unused_feature_c;
+    __asm__ volatile ("cpuid"
+                      : "=a"(unused_feature_a), "=b"(unused_feature_b),
+                        "=c"(unused_feature_c), "=d"(features)
+                      : "a"(0x80000001u), "c"(0));
+    if ((features & (1u << 20)) == 0) {
+        return 0;
+    }
+
+    uint32_t efer_low;
+    uint32_t efer_high;
+    __asm__ volatile ("rdmsr" : "=a"(efer_low), "=d"(efer_high) : "c"(0xc0000080u));
+    efer_low |= 1u << 11;
+    __asm__ volatile ("wrmsr" : : "a"(efer_low), "d"(efer_high),
+                      "c"(0xc0000080u) : "memory");
+    nx_enabled = 1;
+    return 1;
+}
+
 int memory_user_map_page(uint64_t root_physical, uint64_t virtual_address,
                          uint64_t page_physical, int writable,
                          int executable)
 {
-    (void)executable;
     if (!allocator_ready || (virtual_address & (PAGE_SIZE - 1)) != 0 ||
         (page_physical & (PAGE_SIZE - 1)) != 0 ||
         virtual_address < PAGE_SIZE ||
@@ -433,6 +468,12 @@ int memory_user_map_page(uint64_t root_physical, uint64_t virtual_address,
     uint64_t flags = PAGE_PRESENT | PAGE_USER;
     if (writable) {
         flags |= PAGE_WRITABLE;
+    }
+    if (!executable) {
+        if (!nx_enabled && !memory_enable_nx()) {
+            return 0;
+        }
+        flags |= PAGE_NO_EXECUTE;
     }
     pt[pt_index] = page_physical | flags;
     return 1;

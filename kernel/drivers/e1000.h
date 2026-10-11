@@ -11,5 +11,10 @@ void e1000_poll(void);
 int e1000_ping_gateway(void);
 uint64_t e1000_received_frames(void);
 uint64_t e1000_echo_replies(void);
+uint64_t e1000_udp_echoes(void);
+uint64_t e1000_udp_datagrams(void);
+uint64_t e1000_udp_rejected(void);
+uint64_t e1000_tcp_echoes(void);
+uint64_t e1000_tcp_segments(void);
 
 #endif

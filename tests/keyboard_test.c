@@ -50,6 +50,17 @@ int main(void)
     keyboard_feed_scancode(0x48);
     assert(!keyboard_get_key(&key));
 
+    keyboard_feed_scancode(0x1d);
+    keyboard_feed_scancode(0x1f);
+    keyboard_feed_scancode(0x9d);
+    assert(next_key() == 0x13);
+    keyboard_feed_scancode(0xe0);
+    keyboard_feed_scancode(0x1d);
+    keyboard_feed_scancode(0x10);
+    keyboard_feed_scancode(0xe0);
+    keyboard_feed_scancode(0x9d);
+    assert(next_key() == 0x11);
+
     for (uint32_t index = 0; index < 64; ++index) {
         keyboard_feed_scancode(0x1e);
     }

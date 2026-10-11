@@ -10,6 +10,8 @@ set +e
 {
     sleep 6
     printf 'devuser\rdevhost\r'
+    sleep 3
+    printf 'run demo\r'
     sleep 2
 } | timeout 24s "$qemu" -m 2G -cdrom "$iso" \
     -display none -serial stdio -monitor none -no-reboot -no-shutdown \
@@ -24,8 +26,10 @@ if [ "$qemu_status" -ne 124 ]; then
 fi
 
 if ! grep -a -q 'Ring-3 user-process isolation initialized.' "$log" ||
-   ! grep -a -q 'Ring-3 demo: isolated user process says hello.' "$log" ||
-   ! grep -a -q 'Ring-3 process exited cleanly.' "$log"; then
+   ! grep -a -q 'Ring-3 ELF application: isolated process says hello.' "$log" ||
+   ! grep -a -q 'Ring-3 process exited cleanly.' "$log" ||
+   ! grep -a -q 'ELF app scheduled in isolated user mode' "$log" ||
+   [ "$(grep -a -c 'Ring-3 ELF application: isolated process says hello.' "$log")" -lt 2 ]; then
     cat "$log"
     echo "Ring-3 user process did not complete its write/exit syscalls." >&2
     exit 1

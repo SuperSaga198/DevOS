@@ -22,6 +22,7 @@ void *physical_to_virtual(uint64_t physical_address);
 void *memory_map_mmio(uint64_t physical_address, size_t size);
 int memory_create_user_address_space(uint64_t *root_physical);
 int memory_destroy_user_address_space(uint64_t root_physical);
+int memory_enable_nx(void);
 int memory_user_map_page(uint64_t root_physical, uint64_t virtual_address,
                          uint64_t page_physical, int writable,
                          int executable);

@@ -49,6 +49,8 @@
 #define GATEWAY_IPV4_ADDRESS 0x0a000202u
 #define ARP_FRAME_SIZE 42u
 #define ICMP_FRAME_SIZE 47u
+#define DEVOS_UDP_ECHO_PORT 7007u
+#define DEVOS_TCP_ECHO_PORT 7008u
 
 struct e1000_rx_descriptor {
     uint64_t address;
@@ -82,6 +84,12 @@ static uint8_t mac[6];
 static uint8_t gateway_mac[6];
 static volatile uint64_t received_frames;
 static volatile uint64_t echo_replies;
+static volatile uint64_t udp_echoes;
+static volatile uint64_t udp_datagrams;
+static volatile uint64_t udp_rejected;
+static volatile uint64_t tcp_echoes;
+static volatile uint64_t tcp_segments;
+static struct net_tcp_echo_state tcp_echo_state;
 static uint32_t rx_index;
 static uint32_t tx_index;
 static uint16_t icmp_sequence;
@@ -279,6 +287,34 @@ static void handle_ipv4(const uint8_t *frame, size_t size)
         return;
     }
 
+    if (frame[23] == 17) {
+        ++udp_datagrams;
+    }
+    const enum net_packet_result udp_result = net_ipv4_udp_echo_reply(
+        frame, size, DEVOS_IPV4_ADDRESS, DEVOS_UDP_ECHO_PORT,
+        reply, sizeof(reply), &reply_size);
+    if (udp_result == NET_PACKET_REPLY) {
+        if (send_frame(reply, reply_size)) {
+            ++udp_echoes;
+        }
+        return;
+    }
+    if (frame[23] == 17 && udp_result == NET_PACKET_DROP) {
+        ++udp_rejected;
+    }
+
+    if (frame[23] == 6) {
+        ++tcp_segments;
+        const enum net_packet_result tcp_result = net_ipv4_tcp_echo_step(
+            frame, size, DEVOS_IPV4_ADDRESS, DEVOS_TCP_ECHO_PORT,
+            &tcp_echo_state, reply, sizeof(reply), &reply_size);
+        if (tcp_result == NET_PACKET_REPLY &&
+            send_frame(reply, reply_size)) {
+            ++tcp_echoes;
+        }
+        return;
+    }
+
     const uint8_t *ip = frame + 14;
     const size_t ip_header_size = (size_t)(ip[0] & 0x0f) * 4;
     const size_t ip_total_size = read_be16(ip + 2);
@@ -431,6 +467,12 @@ int e1000_init(void)
     tx_index = 0;
     received_frames = 0;
     echo_replies = 0;
+    udp_echoes = 0;
+    udp_datagrams = 0;
+    udp_rejected = 0;
+    tcp_echoes = 0;
+    tcp_segments = 0;
+    tcp_echo_state = (struct net_tcp_echo_state) { 0 };
     icmp_sequence = 0;
     ready = 1;
     (void)reg_read(E1000_REG_STATUS);
@@ -567,4 +609,29 @@ uint64_t e1000_received_frames(void)
 uint64_t e1000_echo_replies(void)
 {
     return echo_replies;
+}
+
+uint64_t e1000_udp_echoes(void)
+{
+    return udp_echoes;
+}
+
+uint64_t e1000_udp_datagrams(void)
+{
+    return udp_datagrams;
+}
+
+uint64_t e1000_udp_rejected(void)
+{
+    return udp_rejected;
+}
+
+uint64_t e1000_tcp_echoes(void)
+{
+    return tcp_echoes;
+}
+
+uint64_t e1000_tcp_segments(void)
+{
+    return tcp_segments;
 }

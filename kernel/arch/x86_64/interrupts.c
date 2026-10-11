@@ -8,6 +8,7 @@
 
 #include "../../core/memory.h"
 #include "../../core/scheduler.h"
+#include "../../core/syscall.h"
 
 #include <stdint.h>
 
@@ -161,13 +162,13 @@ uintptr_t syscall_interrupt_handler(void *saved_frame)
     if (frame == NULL) {
         return 0;
     }
-    if (frame->rax == 0) {
+    if (frame->rax == DEVOS_SYSCALL_EXIT) {
         serial_write("Ring-3 process exited cleanly.\r\n");
         return scheduler_exit_user((uintptr_t)frame);
     }
-    if (frame->rax == 1) {
+    if (frame->rax == DEVOS_SYSCALL_WRITE) {
         const size_t length = (size_t)frame->rsi;
-        if (length > 256 ||
+        if (length > DEVOS_SYSCALL_MAX_WRITE ||
             (length != 0 &&
              !memory_user_range_readable(
                  scheduler_current_address_space(),
@@ -179,6 +180,9 @@ uintptr_t syscall_interrupt_handler(void *saved_frame)
         frame->rax = length;
         return (uintptr_t)frame;
     }
+    if (frame->rax == DEVOS_SYSCALL_YIELD) {
+        return scheduler_schedule((uintptr_t)frame);
+    }
     frame->rax = (uint64_t)-1;
     return (uintptr_t)frame;
 }
@@ -189,7 +193,7 @@ uintptr_t kernel_exception_report(uint64_t vector, uint64_t error_code,
 {
     __asm__ volatile ("cli");
     if (saved_frame != NULL &&
-        (saved_frame[18] & 3) == 3) {
+        (saved_frame[16] & 3) == 3) {
         serial_write("\r\nUser process terminated by CPU exception.\r\n");
         return scheduler_exit_user((uintptr_t)saved_frame);
     }

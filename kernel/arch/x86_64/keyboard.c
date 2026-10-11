@@ -10,6 +10,8 @@ static volatile uint8_t key_head;
 static volatile uint8_t key_tail;
 static uint8_t left_shift_down;
 static uint8_t right_shift_down;
+static uint8_t left_control_down;
+static uint8_t right_control_down;
 static uint8_t caps_lock;
 static uint8_t extended_scancode;
 
@@ -107,6 +109,8 @@ int keyboard_init(void)
     key_tail = 0;
     left_shift_down = 0;
     right_shift_down = 0;
+    left_control_down = 0;
+    right_control_down = 0;
     caps_lock = 0;
     extended_scancode = 0;
 
@@ -125,6 +129,9 @@ void keyboard_feed_scancode(uint8_t scancode)
     }
     if (extended_scancode) {
         extended_scancode = 0;
+        if ((scancode & 0x7f) == 0x1d) {
+            right_control_down = (scancode & 0x80) == 0;
+        }
         return;
     }
 
@@ -138,6 +145,10 @@ void keyboard_feed_scancode(uint8_t scancode)
         right_shift_down = !released;
         return;
     }
+    if (code == 0x1d) {
+        left_control_down = !released;
+        return;
+    }
     if (code == 0x3a) {
         if (!released) {
             caps_lock = !caps_lock;
@@ -149,6 +160,11 @@ void keyboard_feed_scancode(uint8_t scancode)
     }
 
     const char base = unshifted[code];
+    if ((left_control_down || right_control_down) &&
+        base >= 'a' && base <= 'z') {
+        queue_key((uint16_t)(base - 'a' + 1));
+        return;
+    }
     if (base == '\n') {
         queue_key(KEYBOARD_KEY_ENTER);
     } else if (base == '\b') {

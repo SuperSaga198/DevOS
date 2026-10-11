@@ -15,6 +15,8 @@
 #include "file_manager.h"
 #include "setup_wizard.h"
 #include "scheduler.h"
+#include "process.h"
+#include "text_editor.h"
 #include "pc_speaker.h"
 #include "e1000.h"
 
@@ -110,11 +112,32 @@ static int pointer_available;
 static uint64_t pointer_x;
 static uint64_t pointer_y;
 static uint8_t pointer_buttons;
+static uint8_t gateway_reachable;
 
 static void shell_write(const char *text)
 {
     serial_write(text);
     framebuffer_terminal_write(text);
+}
+
+static void desktop_refresh_draw(void)
+{
+    struct desktop_runtime_status status = {
+        .network_ready = (uint8_t)network_available,
+        .gateway_reachable = gateway_reachable,
+        .storage_ready = (uint8_t)storage_available,
+        .audio_ready = 1,
+        .udp_echoes = network_available ? e1000_udp_echoes() : 0,
+        .tcp_echoes = network_available ? e1000_tcp_echoes() : 0,
+        .tcp_segments = network_available ? e1000_tcp_segments() : 0,
+    };
+    struct memory_stats memory;
+    if (memory_get_stats(&memory)) {
+        status.managed_pages = memory.managed_pages;
+        status.free_pages = memory.free_pages;
+    }
+    desktop_set_runtime_status(&status);
+    desktop_draw(detected_memory_mib);
 }
 
 static void persist_filesystem_change(void)
@@ -159,69 +182,15 @@ static void network_poll_task(void *argument)
     }
 }
 
-extern const uint8_t user_demo_blob_start[];
-extern const uint8_t user_demo_blob_end[];
+extern const uint8_t user_app_image_start[];
+extern const uint8_t user_app_image_end[];
 
 static int launch_user_demo(void)
 {
     const size_t image_size = (size_t)(
-        (uintptr_t)user_demo_blob_end - (uintptr_t)user_demo_blob_start);
-    if (image_size == 0 || image_size > PAGE_SIZE) {
-        return 0;
-    }
-
-    uint64_t address_space = 0;
-    uint64_t code_page = 0;
-    uint64_t stack_page = 0;
-    if (!memory_create_user_address_space(&address_space)) {
-        return 0;
-    }
-    if (!page_alloc(&code_page)) {
-        (void)memory_destroy_user_address_space(address_space);
-        return 0;
-    }
-    if (!page_alloc(&stack_page)) {
-        (void)page_free(code_page);
-        (void)memory_destroy_user_address_space(address_space);
-        return 0;
-    }
-
-    uint8_t *code = physical_to_virtual(code_page);
-    uint8_t *stack = physical_to_virtual(stack_page);
-    if (code == NULL || stack == NULL) {
-        (void)page_free(code_page);
-        (void)page_free(stack_page);
-        (void)memory_destroy_user_address_space(address_space);
-        return 0;
-    }
-    for (size_t index = 0; index < PAGE_SIZE; ++index) {
-        code[index] = 0;
-        stack[index] = 0;
-    }
-    for (size_t index = 0; index < image_size; ++index) {
-        code[index] = user_demo_blob_start[index];
-    }
-
-    const int code_mapped = memory_user_map_page(
-        address_space, 0x400000, code_page, 0, 1);
-    const int stack_mapped = code_mapped && memory_user_map_page(
-        address_space, 0x7fffe000, stack_page, 1, 0);
-    if (!code_mapped || !stack_mapped) {
-        (void)memory_destroy_user_address_space(address_space);
-        if (!code_mapped) {
-            (void)page_free(code_page);
-        }
-        if (!stack_mapped) {
-            (void)page_free(stack_page);
-        }
-        return 0;
-    }
-    if (!scheduler_create_user("user-demo", address_space,
-                               0x400000, 0x7ffff000)) {
-        (void)memory_destroy_user_address_space(address_space);
-        return 0;
-    }
-    return 1;
+        (uintptr_t)user_app_image_end - (uintptr_t)user_app_image_start);
+    return process_exec_elf("demo", user_app_image_start,
+                            image_size);
 }
 
 static void shell_write_hex(uint64_t value)
@@ -570,6 +539,50 @@ static void shell_open_terminal(void)
     shell_prompt();
 }
 
+static void editor_render(const char *status)
+{
+    framebuffer_terminal_clear();
+    framebuffer_terminal_write("DEVOS EDITOR: ");
+    framebuffer_terminal_write(text_editor_path());
+    framebuffer_terminal_write(
+        "\r\nCtrl+S or :w save | Ctrl+Q or :q discard and exit\r\n");
+    framebuffer_terminal_write("----------------------------------------\r\n");
+
+    const char *contents = text_editor_contents();
+    const size_t size = text_editor_size();
+    for (size_t index = 0; index < size; ++index) {
+        const unsigned char value = (unsigned char)contents[index];
+        char character[2] = {
+            value == '\n' ? '\n' :
+                value >= 0x20 && value <= 0x7e ? (char)value : '?',
+            '\0',
+        };
+        framebuffer_terminal_write(character);
+    }
+    framebuffer_terminal_write("\r\n----------------------------------------\r\n");
+    framebuffer_terminal_write("Changes are unsaved until saved");
+    if (status != NULL) {
+        framebuffer_terminal_write(" - ");
+        framebuffer_terminal_write(status);
+    }
+    framebuffer_terminal_write("\r\n");
+}
+
+static void editor_echo_input(uint16_t key)
+{
+    if (key == KEYBOARD_KEY_ENTER || key == '\r' || key == '\n') {
+        framebuffer_terminal_write("\r\n");
+        serial_write("\r\n");
+    } else if (key == KEYBOARD_KEY_BACKSPACE || key == '\b' || key == 0x7f) {
+        framebuffer_terminal_backspace();
+        serial_write("\b \b");
+    } else if (key >= 0x20 && key <= 0x7e) {
+        const char character[2] = { (char)key, '\0' };
+        framebuffer_terminal_write(character);
+        serial_write(character);
+    }
+}
+
 static void shell_execute(void)
 {
     command[command_length] = '\0';
@@ -603,10 +616,13 @@ static void shell_execute(void)
         shell_write("  start APP - open a desktop app window\r\n");
         shell_write("  focus APP - focus an open desktop app\r\n");
         shell_write("  close APP - close a desktop app window\r\n");
+        shell_write("  run demo  - load and run the built-in ELF user app\r\n");
         shell_write("  ps       - list scheduled kernel tasks\r\n");
         shell_write("  sysinfo  - show system service readiness\r\n");
         shell_write("  net      - show network service status\r\n");
         shell_write("  ping     - send an ICMP echo to the QEMU gateway\r\n");
+        shell_write("  udp      - show UDP echo service status (port 7007)\r\n");
+        shell_write("  tcp      - show TCP echo service status (port 7008)\r\n");
         shell_write("  audio    - show audio service status\r\n");
         shell_write("  beep [HZ [MS]] - play a PC speaker tone\r\n");
         shell_write("  ls [PATH]       - list a RAM filesystem directory\r\n");
@@ -614,6 +630,7 @@ static void shell_execute(void)
         shell_write("  touch PATH      - create an empty file\r\n");
         shell_write("  write PATH TEXT - replace a file's contents\r\n");
         shell_write("  cat PATH        - print a file\r\n");
+        shell_write("  edit PATH       - edit a file (Ctrl+S save, Ctrl+Q discard)\r\n");
         shell_write("  elfcheck PATH   - validate an ELF64 x86-64 executable\r\n");
         shell_write("  rm PATH         - remove an empty file or directory\r\n");
         shell_write("  uptime          - show time since boot\r\n");
@@ -727,11 +744,38 @@ static void shell_execute(void)
                 shell_write("Started desktop window: ");
                 shell_write(app);
                 shell_write("\r\n");
-                desktop_draw(detected_memory_mib);
+                desktop_refresh_draw();
             } else {
                 shell_write("start: unable to open ");
                 shell_write(app);
                 shell_write("\r\n");
+            }
+        }
+    } else if (command_is("run")) {
+        char *app = take_token(&arguments_end);
+        if (app == NULL) {
+            shell_write("run: expected the app name 'demo'\r\n");
+        } else {
+            size_t app_name_index = 0;
+            static const char expected_app[] = "demo";
+            while (app[app_name_index] != '\0' &&
+                   expected_app[app_name_index] != '\0') {
+                char actual = app[app_name_index];
+                if (actual >= 'A' && actual <= 'Z') {
+                    actual = (char)(actual - 'A' + 'a');
+                }
+                if (actual != expected_app[app_name_index]) {
+                    break;
+                }
+                ++app_name_index;
+            }
+            if (app[app_name_index] != '\0' ||
+                expected_app[app_name_index] != '\0') {
+                shell_write("run: unknown built-in application\r\n");
+            } else if (!launch_user_demo()) {
+                shell_write("run: could not load or schedule the ELF app\r\n");
+            } else {
+                shell_write("ELF app scheduled in isolated user mode\r\n");
             }
         }
     } else if (command_is("focus")) {
@@ -742,7 +786,7 @@ static void shell_execute(void)
             shell_write("focus: window is not open\r\n");
         } else {
             desktop_window_focus(app);
-            desktop_draw(detected_memory_mib);
+            desktop_refresh_draw();
             shell_write("Focused window: ");
             shell_write(app);
             shell_write("\r\n");
@@ -754,7 +798,7 @@ static void shell_execute(void)
         } else if (!desktop_window_close(app)) {
             shell_write("close: window not found\r\n");
         } else {
-            desktop_draw(detected_memory_mib);
+            desktop_refresh_draw();
             shell_write("Closed window: ");
             shell_write(app);
             shell_write("\r\n");
@@ -810,15 +854,51 @@ static void shell_execute(void)
             shell_write_uint(e1000_received_frames());
             shell_write("; ICMP replies ");
             shell_write_uint(e1000_echo_replies());
+            shell_write("; UDP echo replies ");
+            shell_write_uint(e1000_udp_echoes());
+            shell_write("; UDP echo port 7007");
+            shell_write("; UDP RX ");
+            shell_write_uint(e1000_udp_datagrams());
+            shell_write("; UDP rejected ");
+            shell_write_uint(e1000_udp_rejected());
+            shell_write("; TCP echo replies ");
+            shell_write_uint(e1000_tcp_echoes());
+            shell_write("; TCP RX ");
+            shell_write_uint(e1000_tcp_segments());
+            shell_write("; TCP echo port 7008");
             shell_write("\r\n");
         }
     } else if (command_is("ping")) {
         if (!network_available) {
             shell_write("ping: no supported e1000 NIC detected\r\n");
         } else if (e1000_ping_gateway()) {
+            gateway_reachable = 1;
             shell_write("10.0.2.2 replied to ICMP echo\r\n");
         } else {
+            gateway_reachable = 0;
             shell_write("ping: no ICMP reply from 10.0.2.2\r\n");
+        }
+    } else if (command_is("udp")) {
+        if (!network_available) {
+            shell_write("udp: no supported e1000 NIC detected\r\n");
+        } else {
+            shell_write("UDP echo service: IPv4 10.0.2.15 port 7007; replies ");
+            shell_write_uint(e1000_udp_echoes());
+            shell_write(" of ");
+            shell_write_uint(e1000_udp_datagrams());
+            shell_write(" datagrams; rejected ");
+            shell_write_uint(e1000_udp_rejected());
+            shell_write("\r\n");
+        }
+    } else if (command_is("tcp")) {
+        if (!network_available) {
+            shell_write("tcp: no supported e1000 NIC detected\r\n");
+        } else {
+            shell_write("TCP echo service: IPv4 10.0.2.15 port 7008; replies ");
+            shell_write_uint(e1000_tcp_echoes());
+            shell_write(" of ");
+            shell_write_uint(e1000_tcp_segments());
+            shell_write(" received segments\r\n");
         }
     } else if (command_is("audio")) {
         shell_write("Audio: PC speaker PIT tone output; no PCM/mixer backend\r\n");
@@ -878,6 +958,17 @@ static void shell_execute(void)
         } else {
             shell_cat(path);
         }
+    } else if (command_is("edit")) {
+        char *path = take_token(&arguments_end);
+        if (path == NULL || !text_editor_open(path)) {
+            shell_write("edit: expected a valid file path\r\n");
+        } else {
+            serial_write("Text editor open: ");
+            serial_write(text_editor_path());
+            serial_write("\r\n");
+            editor_render(NULL);
+            return;
+        }
     } else if (command_is("elfcheck")) {
         shell_elfcheck(take_token(&arguments_end));
     } else if (command_is("rm")) {
@@ -891,7 +982,7 @@ static void shell_execute(void)
         }
     } else if (command_is("home")) {
         terminal_open = 0;
-        desktop_draw(detected_memory_mib);
+        desktop_refresh_draw();
         command_length = 0;
         return;
     } else if (command_length != 0) {
@@ -904,6 +995,29 @@ static void shell_execute(void)
 
 static void shell_input(uint16_t key)
 {
+    if (text_editor_is_open()) {
+        const enum text_editor_result result = text_editor_input(key);
+        if (result == TEXT_EDITOR_CHANGED) {
+            editor_echo_input(key);
+        } else if (result == TEXT_EDITOR_SAVED) {
+            if (key == KEYBOARD_KEY_ENTER || key == '\r' || key == '\n') {
+                editor_echo_input(key);
+            }
+            serial_write("Text editor saved.\r\n");
+            framebuffer_terminal_write("\r\nSaved.\r\n");
+            file_manager_refresh();
+            desktop_file_manager_refresh();
+            persist_filesystem_change();
+        } else if (result == TEXT_EDITOR_CLOSED) {
+            framebuffer_terminal_clear();
+            shell_write("Editor closed.\r\n");
+            shell_prompt();
+        } else if (result == TEXT_EDITOR_ERROR) {
+            framebuffer_terminal_write("\r\nEditor limit reached or save failed.\r\n");
+        }
+        return;
+    }
+
     if (key == KEYBOARD_KEY_ENTER || key == '\r' || key == '\n') {
         shell_write("\r\n");
         shell_execute();
@@ -940,6 +1054,9 @@ static void kernel_shell(void)
         const int have_pointer_event = mouse_get_event(&pointer_event);
         if (!have_key && !have_serial_character && !have_pointer_event) {
             __asm__ volatile ("sti; hlt");
+            if (desktop_animation_step()) {
+                desktop_refresh_draw();
+            }
             continue;
         }
         __asm__ volatile ("sti");
@@ -956,14 +1073,25 @@ static void kernel_shell(void)
                 } else if (desktop_action == DESKTOP_ACTION_FILE_PARENT ||
                            desktop_action >= DESKTOP_ACTION_FILE_ITEM_BASE) {
                     file_manager_activate(desktop_action);
-                    desktop_draw(detected_memory_mib);
+                    desktop_refresh_draw();
                 } else if (desktop_action == DESKTOP_ACTION_AUDIO_TEST_TONE) {
                     if (!pc_speaker_play_tone(880, 180)) {
                         serial_write("Desktop audio test tone failed.\r\n");
                     }
-                    desktop_draw(detected_memory_mib);
-                } else if (desktop_action == DESKTOP_ACTION_REDRAW) {
-                    desktop_draw(detected_memory_mib);
+                    desktop_refresh_draw();
+                } else if (desktop_action == DESKTOP_ACTION_NETWORK_PING) {
+                    gateway_reachable = e1000_ping_gateway() != 0;
+                    if (gateway_reachable) {
+                        serial_write("Desktop network panel: gateway replied.\r\n");
+                    } else {
+                        serial_write("Desktop network panel: gateway ping failed.\r\n");
+                    }
+                    desktop_refresh_draw();
+                } else if (desktop_action == DESKTOP_ACTION_REDRAW ||
+                           desktop_action == DESKTOP_ACTION_ANIMATION_TOGGLE ||
+                           (desktop_action >= DESKTOP_ACTION_WALLPAPER_BASE &&
+                            desktop_action < DESKTOP_ACTION_WALLPAPER_BASE + 4)) {
+                    desktop_refresh_draw();
                 }
             }
         }
@@ -1020,7 +1148,7 @@ void kernel_main(void)
     if (response != NULL && response->framebuffers != NULL &&
         response->framebuffer_count > 0 &&
         framebuffer_init(response->framebuffers[0])) {
-        desktop_draw(detected_memory_mib);
+        desktop_refresh_draw();
         serial_write("Framebuffer desktop initialized.\r\n");
     } else {
         serial_write("Framebuffer unavailable; using serial console.\r\n");
@@ -1081,7 +1209,7 @@ void kernel_main(void)
     desktop_file_manager_refresh();
     first_run_setup();
     if (framebuffer_width() != 0 && framebuffer_height() != 0) {
-        desktop_draw(detected_memory_mib);
+        desktop_refresh_draw();
     }
     __asm__ volatile ("cli");
     scheduler_init();

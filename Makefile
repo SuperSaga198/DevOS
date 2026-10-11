@@ -13,7 +13,8 @@ LDFLAGS := -nostdlib -z max-page-size=0x1000 \
 	-T kernel/arch/x86_64/linker.ld
 
 .PHONY: all clean test test-storage test-pointer test-oobe test-scheduler \
-		test-audio test-network test-user-process iso run
+		test-audio test-network test-user-process test-editor measure-memory \
+		test-vm iso run
 
 all: $(KERNEL)
 
@@ -22,6 +23,7 @@ test: $(BUILD_DIR)/framebuffer-test $(BUILD_DIR)/keyboard-test \
 		$(BUILD_DIR)/fs-disk-test $(BUILD_DIR)/elf64-test \
 		$(BUILD_DIR)/net-packet-test $(BUILD_DIR)/mouse-test \
 		$(BUILD_DIR)/desktop-window-test $(BUILD_DIR)/file-manager-test \
+		$(BUILD_DIR)/text-editor-test \
 		$(BUILD_DIR)/system-test $(BUILD_DIR)/setup-wizard-test \
 		$(BUILD_DIR)/scheduler-test $(BUILD_DIR)/pc-speaker-test
 	./$(BUILD_DIR)/framebuffer-test
@@ -34,6 +36,7 @@ test: $(BUILD_DIR)/framebuffer-test $(BUILD_DIR)/keyboard-test \
 	./$(BUILD_DIR)/mouse-test
 	./$(BUILD_DIR)/desktop-window-test
 	./$(BUILD_DIR)/file-manager-test
+	./$(BUILD_DIR)/text-editor-test
 	./$(BUILD_DIR)/system-test
 	./$(BUILD_DIR)/setup-wizard-test
 	./$(BUILD_DIR)/scheduler-test
@@ -56,9 +59,20 @@ test-audio: iso
 
 test-network: iso
 	bash scripts/test-network.sh $(QEMU) $(BUILD_DIR)/devos.iso
+	python3 scripts/test-udp.py $(QEMU) $(BUILD_DIR)/devos.iso
+	python3 scripts/test-tcp.py $(QEMU) $(BUILD_DIR)/devos.iso
 
 test-user-process: iso
 	bash scripts/test-user-process.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-editor: iso
+	bash scripts/test-editor.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+measure-memory: iso
+	python3 scripts/measure-memory.py $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-vm: iso test
+	bash scripts/test-vm.sh $(QEMU) $(BUILD_DIR)/devos.iso
 
 iso: $(KERNEL)
 	bash scripts/make-iso.sh
@@ -85,6 +99,8 @@ $(BUILD_DIR)/main.o: kernel/core/main.c kernel/core/framebuffer.h kernel/core/fs
 		kernel/core/file_manager.h \
 		kernel/core/setup_wizard.h \
 		kernel/core/scheduler.h \
+		kernel/core/process.h \
+		kernel/core/text_editor.h \
 		kernel/drivers/pc_speaker.h \
 		kernel/drivers/e1000.h \
 		kernel/drivers/ata_pio.h \
@@ -119,7 +135,7 @@ $(BUILD_DIR)/interrupts.o: kernel/arch/x86_64/interrupts.c \
 		kernel/arch/x86_64/mouse.h \
 		kernel/arch/x86_64/serial.h kernel/arch/x86_64/timer.h \
 		kernel/arch/x86_64/tss.h kernel/core/memory.h \
-		kernel/core/scheduler.h | $(BUILD_DIR)
+		kernel/core/scheduler.h kernel/core/syscall.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -Ikernel/core -c $< -o $@
 
 $(BUILD_DIR)/tss.o: kernel/arch/x86_64/tss.c \
@@ -145,7 +161,15 @@ $(BUILD_DIR)/serial.o: kernel/arch/x86_64/serial.c \
 $(BUILD_DIR)/interrupt_stubs.o: kernel/arch/x86_64/interrupt_stubs.S | $(BUILD_DIR)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/user_demo.o: kernel/arch/x86_64/user_demo.S | $(BUILD_DIR)
+$(BUILD_DIR)/demo-app.o: kernel/apps/demo.S | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/demo-app.elf: $(BUILD_DIR)/demo-app.o kernel/apps/demo.ld
+	$(LD) -nostdlib -z max-page-size=0x1000 \
+		-T kernel/apps/demo.ld -o $@ $<
+
+$(BUILD_DIR)/user-app-image.o: kernel/core/user_app_image.S \
+		$(BUILD_DIR)/demo-app.elf
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/framebuffer.o: kernel/core/framebuffer.c kernel/core/framebuffer.h \
@@ -177,8 +201,17 @@ $(BUILD_DIR)/scheduler.o: kernel/core/scheduler.c \
 		kernel/core/scheduler.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/core -Ikernel/arch/x86_64 -c $< -o $@
 
+$(BUILD_DIR)/process.o: kernel/core/process.c kernel/core/process.h \
+		kernel/core/elf64.h kernel/core/memory.h \
+		kernel/core/scheduler.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -Ikernel/arch/x86_64 -c $< -o $@
+
 $(BUILD_DIR)/file_manager.o: kernel/core/file_manager.c \
 		kernel/core/file_manager.h kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
+
+$(BUILD_DIR)/text_editor.o: kernel/core/text_editor.c \
+		kernel/core/text_editor.h kernel/core/fs.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
 
 $(BUILD_DIR)/framebuffer-test: tests/framebuffer_test.c \
@@ -247,6 +280,13 @@ $(BUILD_DIR)/file-manager-test: tests/file_manager_test.c \
 		-Ikernel/core tests/file_manager_test.c kernel/core/file_manager.c \
 		kernel/core/fs.c -o $@
 
+$(BUILD_DIR)/text-editor-test: tests/text_editor_test.c \
+		kernel/core/text_editor.c kernel/core/text_editor.h \
+		kernel/core/fs.c kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core tests/text_editor_test.c \
+		kernel/core/text_editor.c kernel/core/fs.c -o $@
+
 $(BUILD_DIR)/setup-wizard.o: kernel/core/setup_wizard.c \
 		kernel/core/setup_wizard.h kernel/core/fs.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
@@ -273,7 +313,7 @@ $(BUILD_DIR)/pc-speaker-test: tests/pc_speaker_test.c \
 
 $(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/framebuffer.o $(BUILD_DIR)/interrupts.o \
-		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user_demo.o \
+		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user-app-image.o \
 		$(BUILD_DIR)/pci.o $(BUILD_DIR)/ata_pio.o \
 		$(BUILD_DIR)/pc_speaker.o $(BUILD_DIR)/e1000.o \
 		$(BUILD_DIR)/fs.o $(BUILD_DIR)/fs_disk.o \
@@ -282,13 +322,14 @@ $(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/memory.o $(BUILD_DIR)/timer.o \
 		$(BUILD_DIR)/keyboard.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/serial.o \
 		$(BUILD_DIR)/file_manager.o \
+		$(BUILD_DIR)/text_editor.o \
 		$(BUILD_DIR)/system.o $(BUILD_DIR)/setup-wizard.o \
-		$(BUILD_DIR)/scheduler.o \
+		$(BUILD_DIR)/scheduler.o $(BUILD_DIR)/process.o \
 		$(BUILD_DIR)/interrupt_stubs.o \
 		kernel/arch/x86_64/linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/framebuffer.o $(BUILD_DIR)/interrupts.o \
-		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user_demo.o \
+		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user-app-image.o \
 		$(BUILD_DIR)/pci.o $(BUILD_DIR)/ata_pio.o \
 		$(BUILD_DIR)/pc_speaker.o $(BUILD_DIR)/e1000.o \
 		$(BUILD_DIR)/fs.o $(BUILD_DIR)/fs_disk.o \
@@ -297,8 +338,9 @@ $(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/memory.o $(BUILD_DIR)/timer.o \
 		$(BUILD_DIR)/keyboard.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/serial.o \
 		$(BUILD_DIR)/file_manager.o \
+		$(BUILD_DIR)/text_editor.o \
 		$(BUILD_DIR)/system.o $(BUILD_DIR)/setup-wizard.o \
-		$(BUILD_DIR)/scheduler.o \
+		$(BUILD_DIR)/scheduler.o $(BUILD_DIR)/process.o \
 		$(BUILD_DIR)/interrupt_stubs.o
 
 clean:
