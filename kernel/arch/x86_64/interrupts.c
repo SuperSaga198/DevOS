@@ -193,7 +193,7 @@ uintptr_t kernel_exception_report(uint64_t vector, uint64_t error_code,
 {
     __asm__ volatile ("cli");
     if (saved_frame != NULL &&
-        (saved_frame[16] & 3) == 3) {
+        (saved_frame[18] & 3) == 3) {
         serial_write("\r\nUser process terminated by CPU exception.\r\n");
         return scheduler_exit_user((uintptr_t)saved_frame);
     }
@@ -203,6 +203,12 @@ uintptr_t kernel_exception_report(uint64_t vector, uint64_t error_code,
     serial_write_hex(error_code);
     serial_write(" rip=0x");
     serial_write_hex(instruction_pointer);
+    if (saved_frame != NULL) {
+        serial_write(" cs=0x");
+        serial_write_hex(saved_frame[18]);
+        serial_write(" rflags=0x");
+        serial_write_hex(saved_frame[19]);
+    }
     if (vector == 14) {
         uint64_t fault_address;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));

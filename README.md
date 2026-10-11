@@ -114,8 +114,8 @@ run:
 make iso
 ```
 
-The script downloads the pinned Limine v12.9.3 binary release into `build/`,
-packages the kernel as `build/devos.iso`, and installs the Limine BIOS boot
+The script downloads the pinned Limine v12.9.3 binary release, verifies its
+SHA-256, packages the kernel as `build/devos.iso`, and installs the Limine BIOS boot
 stage. ISO timestamps derive from `SOURCE_DATE_EPOCH` (or the latest Git commit
 timestamp when unset) to make packaging repeatable for the same source and
 toolchain. GitHub Actions runs `make test-vm`, retains the tested ISO and its

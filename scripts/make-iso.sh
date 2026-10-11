@@ -4,6 +4,7 @@ set -euo pipefail
 root_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 build_dir="$root_dir/build"
 limine_version="v12.9.3"
+limine_archive_sha256="9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d"
 archive="$build_dir/limine-binary.tar.gz"
 archive_tmp="$build_dir/limine-binary.tar.gz.tmp.$$"
 limine_dir="$build_dir/limine-binary"
@@ -18,7 +19,7 @@ fi
 
 trap 'rm -f "$archive_tmp"' EXIT
 
-for tool in curl tar make xorriso; do
+for tool in curl tar make xorriso sha256sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'error: required tool not found: %s\n' "$tool" >&2
         exit 1
@@ -31,6 +32,13 @@ if [[ ! -f "$archive" ]]; then
         "https://github.com/Limine-Bootloader/Limine/releases/download/${limine_version}/limine-binary.tar.gz" \
         --output "$archive_tmp"
     mv "$archive_tmp" "$archive"
+fi
+
+if ! printf '%s  %s\n' "$limine_archive_sha256" "$archive" |
+    sha256sum --check --status; then
+    printf 'error: Limine %s archive checksum mismatch: %s\n' \
+        "$limine_version" "$archive" >&2
+    exit 1
 fi
 
 if [[ ! -x "$limine_dir/limine" ]]; then
