@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 
+#define FS_SNAPSHOT_RECORD_SIZE 2087U
 #define FS_SNAPSHOT_SIZE 133568U
 
 enum fs_node_type {

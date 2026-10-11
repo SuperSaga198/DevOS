@@ -5,7 +5,6 @@
 #define FS_NODE_CAPACITY 64
 #define FS_NAME_CAPACITY 32
 #define FS_FILE_CAPACITY 2048
-#define FS_SNAPSHOT_RECORD_SIZE 2087
 #define FS_SNAPSHOT_USED_OFFSET 0
 #define FS_SNAPSHOT_TYPE_OFFSET 1
 #define FS_SNAPSHOT_PARENT_OFFSET 2
@@ -397,6 +396,11 @@ int fs_snapshot_import(const void *buffer, size_t size)
         const uint8_t *record = bytes + index * FS_SNAPSHOT_RECORD_SIZE;
         const uint8_t used = record[FS_SNAPSHOT_USED_OFFSET];
         if (used == 0) {
+            for (size_t byte = 0; byte < FS_SNAPSHOT_RECORD_SIZE; ++byte) {
+                if (record[byte] != 0) {
+                    return 0;
+                }
+            }
             continue;
         }
         const uint8_t type = record[FS_SNAPSHOT_TYPE_OFFSET];

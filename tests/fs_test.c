@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 int main(void)
 {
@@ -45,6 +46,19 @@ int main(void)
     assert(fs_lookup("/home/dev/readme.txt") == NULL);
     assert(fs_remove("/home/dev"));
     assert(fs_remove("/home"));
+
+    uint8_t snapshot[FS_SNAPSHOT_SIZE];
+    memset(snapshot, 0, sizeof(snapshot));
+    assert(fs_snapshot_export(snapshot, sizeof(snapshot)));
+    for (size_t index = 0; index < 64; ++index) {
+        const size_t offset = index * FS_SNAPSHOT_RECORD_SIZE;
+        if (snapshot[offset] == 0) {
+            snapshot[offset] = 1;
+            assert(!fs_snapshot_import(snapshot, sizeof(snapshot)));
+            snapshot[offset] = 0;
+            break;
+        }
+    }
 
     for (uint32_t index = 0; index < 63; ++index) {
         char path[] = "/node000";
