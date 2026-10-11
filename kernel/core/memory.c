@@ -6,6 +6,13 @@
 #define MAX_PHYSICAL_PAGES (MAX_PHYSICAL_ADDRESS / PAGE_SIZE)
 #define BITMAP_WORDS (MAX_PHYSICAL_PAGES / 64)
 #define HEAP_MAGIC 0x4445564f53484541ULL
+#define MMIO_VIRTUAL_BASE 0xffffc00000000000ULL
+#define PAGE_PRESENT 0x001ULL
+#define PAGE_WRITABLE 0x002ULL
+#define PAGE_WRITE_THROUGH 0x008ULL
+#define PAGE_CACHE_DISABLE 0x010ULL
+#define PAGE_USER 0x004ULL
+#define PAGE_ADDRESS_MASK 0x000ffffffffff000ULL
 
 static uint64_t managed_bitmap[BITMAP_WORDS];
 static uint64_t allocated_bitmap[BITMAP_WORDS];
@@ -160,6 +167,323 @@ void *physical_to_virtual(uint64_t physical_address)
         return NULL;
     }
     return (void *)(uintptr_t)(direct_map_offset + physical_address);
+}
+
+static uint64_t *page_table_from_entry(uint64_t entry)
+{
+    return physical_to_virtual(entry & PAGE_ADDRESS_MASK);
+}
+
+static uint64_t *allocate_page_table(void)
+{
+    uint64_t physical_address = 0;
+    if (!page_alloc(&physical_address)) {
+        return NULL;
+    }
+    uint64_t *table = physical_to_virtual(physical_address);
+    if (table == NULL) {
+        (void)page_free(physical_address);
+        return NULL;
+    }
+    for (size_t index = 0; index < PAGE_SIZE / sizeof(*table); ++index) {
+        table[index] = 0;
+    }
+    return table;
+}
+
+void *memory_map_mmio(uint64_t physical_address, size_t size)
+{
+    if (!allocator_ready || size == 0 ||
+        physical_address > UINT64_MAX - size) {
+        return NULL;
+    }
+
+    const uint64_t physical_base =
+        physical_address & ~(PAGE_SIZE - 1);
+    const uint64_t physical_end = physical_address + size;
+    if (physical_end > UINT64_MAX - (PAGE_SIZE - 1)) {
+        return NULL;
+    }
+    const uint64_t mapped_end =
+        (physical_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (mapped_end < physical_end) {
+        return NULL;
+    }
+    const uint64_t page_count = (mapped_end - physical_base) / PAGE_SIZE;
+    const uintptr_t virtual_base = (uintptr_t)MMIO_VIRTUAL_BASE;
+    uint64_t root_physical;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(root_physical));
+    uint64_t *root = page_table_from_entry(root_physical);
+    if (root == NULL) {
+        return NULL;
+    }
+
+    for (uint64_t page = 0; page < page_count; ++page) {
+        const uintptr_t address =
+            virtual_base + page * (uintptr_t)PAGE_SIZE;
+        const uint64_t pml4_index = (address >> 39) & 0x1ff;
+        const uint64_t pdpt_index = (address >> 30) & 0x1ff;
+        const uint64_t pd_index = (address >> 21) & 0x1ff;
+        const uint64_t pt_index = (address >> 12) & 0x1ff;
+
+        if ((root[pml4_index] & PAGE_PRESENT) == 0) {
+            uint64_t *table = allocate_page_table();
+            if (table == NULL) {
+                return NULL;
+            }
+            root[pml4_index] =
+                ((uintptr_t)table - direct_map_offset) |
+                PAGE_PRESENT | PAGE_WRITABLE;
+        }
+        uint64_t *pdpt = page_table_from_entry(root[pml4_index]);
+        if (pdpt == NULL) {
+            return NULL;
+        }
+        if ((pdpt[pdpt_index] & PAGE_PRESENT) == 0) {
+            uint64_t *table = allocate_page_table();
+            if (table == NULL) {
+                return NULL;
+            }
+            pdpt[pdpt_index] =
+                ((uintptr_t)table - direct_map_offset) |
+                PAGE_PRESENT | PAGE_WRITABLE;
+        } else if ((pdpt[pdpt_index] & 0x080) != 0) {
+            return NULL;
+        }
+        uint64_t *pd = page_table_from_entry(pdpt[pdpt_index]);
+        if (pd == NULL) {
+            return NULL;
+        }
+        if ((pd[pd_index] & PAGE_PRESENT) == 0) {
+            uint64_t *table = allocate_page_table();
+            if (table == NULL) {
+                return NULL;
+            }
+            pd[pd_index] =
+                ((uintptr_t)table - direct_map_offset) |
+                PAGE_PRESENT | PAGE_WRITABLE;
+        } else if ((pd[pd_index] & 0x080) != 0) {
+            return NULL;
+        }
+        uint64_t *pt = page_table_from_entry(pd[pd_index]);
+        if (pt == NULL || (pt[pt_index] & PAGE_PRESENT) != 0) {
+            return NULL;
+        }
+        pt[pt_index] =
+            (physical_base + page * PAGE_SIZE) |
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH |
+            PAGE_CACHE_DISABLE;
+        __asm__ volatile ("invlpg (%0)" : : "r"(address) : "memory");
+    }
+
+    return (void *)(virtual_base + (physical_address - physical_base));
+}
+
+int memory_create_user_address_space(uint64_t *root_physical)
+{
+    if (!allocator_ready || root_physical == NULL) {
+        return 0;
+    }
+
+    uint64_t current_root_physical;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_root_physical));
+    uint64_t *current_root = page_table_from_entry(current_root_physical);
+    uint64_t *new_root = allocate_page_table();
+    if (current_root == NULL || new_root == NULL) {
+        if (new_root != NULL) {
+            const uint64_t address =
+                (uintptr_t)new_root - direct_map_offset;
+            (void)page_free(address);
+        }
+        return 0;
+    }
+
+    for (size_t index = 256; index < 512; ++index) {
+        new_root[index] = current_root[index];
+    }
+    *root_physical = (uintptr_t)new_root - direct_map_offset;
+    return 1;
+}
+
+int memory_destroy_user_address_space(uint64_t root_physical)
+{
+    if (!allocator_ready || (root_physical & (PAGE_SIZE - 1)) != 0) {
+        return 0;
+    }
+    uint64_t current_root;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_root));
+    if ((current_root & PAGE_ADDRESS_MASK) == root_physical) {
+        return 0;
+    }
+    uint64_t *root = physical_to_virtual(root_physical);
+    if (root == NULL) {
+        return 0;
+    }
+    for (size_t pml4_index = 0; pml4_index < 256; ++pml4_index) {
+        const uint64_t pml4_entry = root[pml4_index];
+        if ((pml4_entry & (PAGE_PRESENT | PAGE_USER)) !=
+            (PAGE_PRESENT | PAGE_USER)) {
+            continue;
+        }
+        uint64_t *pdpt = page_table_from_entry(pml4_entry);
+        if (pdpt == NULL) {
+            return 0;
+        }
+        for (size_t pdpt_index = 0; pdpt_index < 512; ++pdpt_index) {
+            const uint64_t pdpt_entry = pdpt[pdpt_index];
+            if ((pdpt_entry & (PAGE_PRESENT | PAGE_USER)) !=
+                (PAGE_PRESENT | PAGE_USER)) {
+                continue;
+            }
+            uint64_t *pd = page_table_from_entry(pdpt_entry);
+            if (pd == NULL) {
+                return 0;
+            }
+            for (size_t pd_index = 0; pd_index < 512; ++pd_index) {
+                const uint64_t pd_entry = pd[pd_index];
+                if ((pd_entry & (PAGE_PRESENT | PAGE_USER)) !=
+                    (PAGE_PRESENT | PAGE_USER)) {
+                    continue;
+                }
+                uint64_t *pt = page_table_from_entry(pd_entry);
+                if (pt == NULL) {
+                    return 0;
+                }
+                for (size_t pt_index = 0; pt_index < 512; ++pt_index) {
+                    const uint64_t pt_entry = pt[pt_index];
+                    if ((pt_entry & (PAGE_PRESENT | PAGE_USER)) ==
+                        (PAGE_PRESENT | PAGE_USER)) {
+                        (void)page_free(pt_entry & PAGE_ADDRESS_MASK);
+                    }
+                }
+                (void)page_free(pd_entry & PAGE_ADDRESS_MASK);
+            }
+            (void)page_free(pdpt_entry & PAGE_ADDRESS_MASK);
+        }
+        (void)page_free(pml4_entry & PAGE_ADDRESS_MASK);
+    }
+    return page_free(root_physical);
+}
+
+int memory_user_map_page(uint64_t root_physical, uint64_t virtual_address,
+                         uint64_t page_physical, int writable,
+                         int executable)
+{
+    (void)executable;
+    if (!allocator_ready || (virtual_address & (PAGE_SIZE - 1)) != 0 ||
+        (page_physical & (PAGE_SIZE - 1)) != 0 ||
+        virtual_address < PAGE_SIZE ||
+        virtual_address >= 0x0000800000000000ULL ||
+        page_physical >= MAX_PHYSICAL_ADDRESS) {
+        return 0;
+    }
+
+    uint64_t *root = page_table_from_entry(root_physical);
+    if (root == NULL) {
+        return 0;
+    }
+    const uint64_t pml4_index = (virtual_address >> 39) & 0x1ff;
+    const uint64_t pdpt_index = (virtual_address >> 30) & 0x1ff;
+    const uint64_t pd_index = (virtual_address >> 21) & 0x1ff;
+    const uint64_t pt_index = (virtual_address >> 12) & 0x1ff;
+    if (pml4_index >= 256) {
+        return 0;
+    }
+
+    if ((root[pml4_index] & PAGE_PRESENT) == 0) {
+        uint64_t *table = allocate_page_table();
+        if (table == NULL) {
+            return 0;
+        }
+        root[pml4_index] =
+            ((uintptr_t)table - direct_map_offset) |
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    uint64_t *pdpt = page_table_from_entry(root[pml4_index]);
+    if (pdpt == NULL) {
+        return 0;
+    }
+    if ((pdpt[pdpt_index] & PAGE_PRESENT) == 0) {
+        uint64_t *table = allocate_page_table();
+        if (table == NULL) {
+            return 0;
+        }
+        pdpt[pdpt_index] =
+            ((uintptr_t)table - direct_map_offset) |
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    uint64_t *pd = page_table_from_entry(pdpt[pdpt_index]);
+    if (pd == NULL) {
+        return 0;
+    }
+    if ((pd[pd_index] & PAGE_PRESENT) == 0) {
+        uint64_t *table = allocate_page_table();
+        if (table == NULL) {
+            return 0;
+        }
+        pd[pd_index] =
+            ((uintptr_t)table - direct_map_offset) |
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    uint64_t *pt = page_table_from_entry(pd[pd_index]);
+    if (pt == NULL || (pt[pt_index] & PAGE_PRESENT) != 0) {
+        return 0;
+    }
+
+    uint64_t flags = PAGE_PRESENT | PAGE_USER;
+    if (writable) {
+        flags |= PAGE_WRITABLE;
+    }
+    pt[pt_index] = page_physical | flags;
+    return 1;
+}
+
+int memory_user_range_readable(uint64_t root_physical,
+                               uint64_t virtual_address, size_t size)
+{
+    if (!allocator_ready || size == 0 ||
+        virtual_address < PAGE_SIZE ||
+        virtual_address >= 0x0000800000000000ULL ||
+        size > 0x0000800000000000ULL - virtual_address) {
+        return 0;
+    }
+
+    const uint64_t end = virtual_address + size;
+    uint64_t current = virtual_address;
+    while (current < end) {
+        const uint64_t pml4_index = (current >> 39) & 0x1ff;
+        const uint64_t pdpt_index = (current >> 30) & 0x1ff;
+        const uint64_t pd_index = (current >> 21) & 0x1ff;
+        const uint64_t pt_index = (current >> 12) & 0x1ff;
+        uint64_t *root = page_table_from_entry(root_physical);
+        if (root == NULL ||
+            (root[pml4_index] & (PAGE_PRESENT | PAGE_USER)) !=
+                (PAGE_PRESENT | PAGE_USER)) {
+            return 0;
+        }
+        uint64_t *pdpt = page_table_from_entry(root[pml4_index]);
+        if (pdpt == NULL ||
+            (pdpt[pdpt_index] & (PAGE_PRESENT | PAGE_USER)) !=
+                (PAGE_PRESENT | PAGE_USER)) {
+            return 0;
+        }
+        uint64_t *pd = page_table_from_entry(pdpt[pdpt_index]);
+        if (pd == NULL ||
+            (pd[pd_index] & (PAGE_PRESENT | PAGE_USER)) !=
+                (PAGE_PRESENT | PAGE_USER)) {
+            return 0;
+        }
+        uint64_t *pt = page_table_from_entry(pd[pd_index]);
+        if (pt == NULL ||
+            (pt[pt_index] & (PAGE_PRESENT | PAGE_USER)) !=
+                (PAGE_PRESENT | PAGE_USER)) {
+            return 0;
+        }
+        const uint64_t next_page =
+            (current & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+        current = next_page < end ? next_page : end;
+    }
+    return 1;
 }
 
 int memory_get_stats(struct memory_stats *stats)

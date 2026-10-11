@@ -102,6 +102,29 @@ def main():
                     boot_output.decode(errors="replace")
                 )
 
+            serial.settimeout(0.5)
+            while b"OOBE required." not in boot_output:
+                try:
+                    boot_output.extend(serial.recv(4096))
+                except socket.timeout:
+                    if process.poll() is not None:
+                        raise RuntimeError(
+                            f"QEMU exited with status {process.returncode}"
+                        )
+            serial.sendall(b"devuser\rdevhost\r")
+            setup_deadline = time.monotonic() + 8
+            while (time.monotonic() < setup_deadline and
+                   b"OOBE setup complete; no persistent disk" not in boot_output):
+                try:
+                    boot_output.extend(serial.recv(4096))
+                except socket.timeout:
+                    pass
+            if b"OOBE setup complete; no persistent disk" not in boot_output:
+                raise AssertionError(
+                    "OOBE did not complete: " +
+                    boot_output.decode(errors="replace")
+                )
+
             send_pointer_input(qmp_stream, True)
             time.sleep(0.3)
             pressed = send_serial_command(serial, "pointer", 1)

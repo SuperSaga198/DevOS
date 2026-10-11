@@ -6,7 +6,7 @@
 #define TIMER_TICKS_PER_SECOND 100
 
 void timer_init(void);
-void timer_irq_handler(void);
+uintptr_t timer_irq_handler(uintptr_t *interrupted_stack);
 uint64_t timer_ticks(void);
 
 #endif

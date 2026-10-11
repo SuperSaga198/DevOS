@@ -12,14 +12,18 @@ ASFLAGS := -m64
 LDFLAGS := -nostdlib -z max-page-size=0x1000 \
 	-T kernel/arch/x86_64/linker.ld
 
-.PHONY: all clean test test-storage test-pointer iso run
+.PHONY: all clean test test-storage test-pointer test-oobe test-scheduler \
+		test-audio test-network test-user-process iso run
 
 all: $(KERNEL)
 
 test: $(BUILD_DIR)/framebuffer-test $(BUILD_DIR)/keyboard-test \
 		$(BUILD_DIR)/fs-test $(BUILD_DIR)/memory-test \
 		$(BUILD_DIR)/fs-disk-test $(BUILD_DIR)/elf64-test \
-		$(BUILD_DIR)/net-packet-test $(BUILD_DIR)/mouse-test
+		$(BUILD_DIR)/net-packet-test $(BUILD_DIR)/mouse-test \
+		$(BUILD_DIR)/desktop-window-test $(BUILD_DIR)/file-manager-test \
+		$(BUILD_DIR)/system-test $(BUILD_DIR)/setup-wizard-test \
+		$(BUILD_DIR)/scheduler-test $(BUILD_DIR)/pc-speaker-test
 	./$(BUILD_DIR)/framebuffer-test
 	./$(BUILD_DIR)/keyboard-test
 	./$(BUILD_DIR)/fs-test
@@ -28,6 +32,12 @@ test: $(BUILD_DIR)/framebuffer-test $(BUILD_DIR)/keyboard-test \
 	./$(BUILD_DIR)/elf64-test
 	./$(BUILD_DIR)/net-packet-test
 	./$(BUILD_DIR)/mouse-test
+	./$(BUILD_DIR)/desktop-window-test
+	./$(BUILD_DIR)/file-manager-test
+	./$(BUILD_DIR)/system-test
+	./$(BUILD_DIR)/setup-wizard-test
+	./$(BUILD_DIR)/scheduler-test
+	./$(BUILD_DIR)/pc-speaker-test
 
 test-storage: iso
 	bash scripts/test-storage.sh $(QEMU) $(BUILD_DIR)/devos.iso
@@ -35,12 +45,28 @@ test-storage: iso
 test-pointer: iso
 	python3 scripts/test-pointer.py $(QEMU) $(BUILD_DIR)/devos.iso
 
+test-oobe: iso
+	bash scripts/test-oobe.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-scheduler: iso
+	bash scripts/test-scheduler.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-audio: iso
+	bash scripts/test-audio.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-network: iso
+	bash scripts/test-network.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
+test-user-process: iso
+	bash scripts/test-user-process.sh $(QEMU) $(BUILD_DIR)/devos.iso
+
 iso: $(KERNEL)
 	bash scripts/make-iso.sh
 
 run: iso $(BUILD_DIR)/devos-disk.img
 	$(QEMU) -m 2G -cdrom $(BUILD_DIR)/devos.iso \
 		-drive file=$(BUILD_DIR)/devos-disk.img,format=raw,if=ide,index=0,media=disk \
+		-netdev user,id=devos-net -device e1000,netdev=devos-net \
 		-serial stdio -monitor none -no-reboot
 
 $(BUILD_DIR)/devos-disk.img: | $(BUILD_DIR)
@@ -56,6 +82,11 @@ $(BUILD_DIR)/main.o: kernel/core/main.c kernel/core/framebuffer.h kernel/core/fs
 		kernel/core/fs_disk.h \
 		kernel/core/elf64.h \
 		kernel/core/memory.h \
+		kernel/core/file_manager.h \
+		kernel/core/setup_wizard.h \
+		kernel/core/scheduler.h \
+		kernel/drivers/pc_speaker.h \
+		kernel/drivers/e1000.h \
 		kernel/drivers/ata_pio.h \
 		kernel/arch/x86_64/limine.h kernel/arch/x86_64/keyboard.h \
 		kernel/arch/x86_64/mouse.h \
@@ -73,15 +104,31 @@ $(BUILD_DIR)/ata_pio.o: kernel/drivers/ata_pio.c \
 		kernel/drivers/ata_pio.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/drivers -c $< -o $@
 
+$(BUILD_DIR)/pc_speaker.o: kernel/drivers/pc_speaker.c \
+		kernel/drivers/pc_speaker.h kernel/arch/x86_64/timer.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/drivers -Ikernel/arch/x86_64 -c $< -o $@
+
+$(BUILD_DIR)/e1000.o: kernel/drivers/e1000.c \
+		kernel/drivers/e1000.h kernel/core/memory.h \
+		kernel/core/net_packet.h kernel/arch/x86_64/timer.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/drivers -Ikernel/core \
+		-Ikernel/arch/x86_64 -c $< -o $@
+
 $(BUILD_DIR)/interrupts.o: kernel/arch/x86_64/interrupts.c \
 		kernel/arch/x86_64/interrupts.h kernel/arch/x86_64/keyboard.h \
 		kernel/arch/x86_64/mouse.h \
-		kernel/arch/x86_64/serial.h kernel/arch/x86_64/timer.h | $(BUILD_DIR)
+		kernel/arch/x86_64/serial.h kernel/arch/x86_64/timer.h \
+		kernel/arch/x86_64/tss.h kernel/core/memory.h \
+		kernel/core/scheduler.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -Ikernel/core -c $< -o $@
+
+$(BUILD_DIR)/tss.o: kernel/arch/x86_64/tss.c \
+		kernel/arch/x86_64/tss.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -c $< -o $@
 
 $(BUILD_DIR)/timer.o: kernel/arch/x86_64/timer.c \
-		kernel/arch/x86_64/timer.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -c $< -o $@
+		kernel/arch/x86_64/timer.h kernel/core/scheduler.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -Ikernel/core -c $< -o $@
 
 $(BUILD_DIR)/keyboard.o: kernel/arch/x86_64/keyboard.c \
 		kernel/arch/x86_64/keyboard.h | $(BUILD_DIR)
@@ -96,6 +143,9 @@ $(BUILD_DIR)/serial.o: kernel/arch/x86_64/serial.c \
 	$(CC) $(CFLAGS) -Ikernel/arch/x86_64 -c $< -o $@
 
 $(BUILD_DIR)/interrupt_stubs.o: kernel/arch/x86_64/interrupt_stubs.S | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user_demo.o: kernel/arch/x86_64/user_demo.S | $(BUILD_DIR)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/framebuffer.o: kernel/core/framebuffer.c kernel/core/framebuffer.h \
@@ -119,6 +169,17 @@ $(BUILD_DIR)/net_packet.o: kernel/core/net_packet.c \
 $(BUILD_DIR)/memory.o: kernel/core/memory.c kernel/core/memory.h \
 		kernel/arch/x86_64/limine.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -Ikernel/core -Ikernel/arch/x86_64 -c $< -o $@
+
+$(BUILD_DIR)/system.o: kernel/core/system.c kernel/core/system.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
+
+$(BUILD_DIR)/scheduler.o: kernel/core/scheduler.c \
+		kernel/core/scheduler.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -Ikernel/arch/x86_64 -c $< -o $@
+
+$(BUILD_DIR)/file_manager.o: kernel/core/file_manager.c \
+		kernel/core/file_manager.h kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
 
 $(BUILD_DIR)/framebuffer-test: tests/framebuffer_test.c \
 		kernel/core/framebuffer.c kernel/core/framebuffer.h \
@@ -167,24 +228,77 @@ $(BUILD_DIR)/memory-test: tests/memory_test.c kernel/core/memory.c \
 		-Ikernel/core -Ikernel/arch/x86_64 \
 		tests/memory_test.c kernel/core/memory.c -o $@
 
+$(BUILD_DIR)/desktop-window-test: tests/desktop_window_test.c \
+		kernel/core/framebuffer.c kernel/core/framebuffer.h \
+		kernel/arch/x86_64/limine.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core -Ikernel/arch/x86_64 \
+		tests/desktop_window_test.c kernel/core/framebuffer.c -o $@
+
+$(BUILD_DIR)/system-test: tests/system_state_test.c kernel/core/system.c \
+		kernel/core/system.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core tests/system_state_test.c kernel/core/system.c -o $@
+
+$(BUILD_DIR)/file-manager-test: tests/file_manager_test.c \
+		kernel/core/file_manager.c kernel/core/file_manager.h \
+		kernel/core/fs.c kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core tests/file_manager_test.c kernel/core/file_manager.c \
+		kernel/core/fs.c -o $@
+
+$(BUILD_DIR)/setup-wizard.o: kernel/core/setup_wizard.c \
+		kernel/core/setup_wizard.h kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Ikernel/core -c $< -o $@
+
+$(BUILD_DIR)/setup-wizard-test: tests/setup_wizard_test.c \
+		kernel/core/setup_wizard.c kernel/core/fs.c \
+		kernel/core/setup_wizard.h kernel/core/fs.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core tests/setup_wizard_test.c \
+		kernel/core/setup_wizard.c kernel/core/fs.c -o $@
+
+$(BUILD_DIR)/scheduler-test: tests/scheduler_test.c \
+		kernel/core/scheduler.c kernel/core/scheduler.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/core tests/scheduler_test.c \
+		kernel/core/scheduler.c -o $@
+
+$(BUILD_DIR)/pc-speaker-test: tests/pc_speaker_test.c \
+		kernel/drivers/pc_speaker.c kernel/drivers/pc_speaker.h \
+		kernel/arch/x86_64/timer.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
+		-Ikernel/drivers -Ikernel/arch/x86_64 \
+		tests/pc_speaker_test.c kernel/drivers/pc_speaker.c -o $@
+
 $(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/framebuffer.o $(BUILD_DIR)/interrupts.o \
+		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user_demo.o \
 		$(BUILD_DIR)/pci.o $(BUILD_DIR)/ata_pio.o \
+		$(BUILD_DIR)/pc_speaker.o $(BUILD_DIR)/e1000.o \
 		$(BUILD_DIR)/fs.o $(BUILD_DIR)/fs_disk.o \
 		$(BUILD_DIR)/elf64.o \
 		$(BUILD_DIR)/net_packet.o \
 		$(BUILD_DIR)/memory.o $(BUILD_DIR)/timer.o \
 		$(BUILD_DIR)/keyboard.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/serial.o \
+		$(BUILD_DIR)/file_manager.o \
+		$(BUILD_DIR)/system.o $(BUILD_DIR)/setup-wizard.o \
+		$(BUILD_DIR)/scheduler.o \
 		$(BUILD_DIR)/interrupt_stubs.o \
 		kernel/arch/x86_64/linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/main.o \
 		$(BUILD_DIR)/framebuffer.o $(BUILD_DIR)/interrupts.o \
+		$(BUILD_DIR)/tss.o $(BUILD_DIR)/user_demo.o \
 		$(BUILD_DIR)/pci.o $(BUILD_DIR)/ata_pio.o \
+		$(BUILD_DIR)/pc_speaker.o $(BUILD_DIR)/e1000.o \
 		$(BUILD_DIR)/fs.o $(BUILD_DIR)/fs_disk.o \
 		$(BUILD_DIR)/elf64.o \
 		$(BUILD_DIR)/net_packet.o \
 		$(BUILD_DIR)/memory.o $(BUILD_DIR)/timer.o \
 		$(BUILD_DIR)/keyboard.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/serial.o \
+		$(BUILD_DIR)/file_manager.o \
+		$(BUILD_DIR)/system.o $(BUILD_DIR)/setup-wizard.o \
+		$(BUILD_DIR)/scheduler.o \
 		$(BUILD_DIR)/interrupt_stubs.o
 
 clean:

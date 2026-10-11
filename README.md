@@ -22,8 +22,28 @@ keyboard-driven terminal. The kernel installs an IDT, remaps the legacy PIC,
 installs exception diagnostics and a 100 Hz timer, and halts between interrupts.
 Press `T` on the dashboard to open the terminal. It supports `help`, `mem`,
 `ver`, `uptime`, `disk`, `pointer`, `elfcheck`, `pagealloc`, `pagefree`, `fault`,
-`faultpf`, `clear`, `home`, `ls`, `mkdir`, `touch`, `write`, `cat`, and `rm`;
-COM1 serial input remains available. The `fault` command deliberately halts the kernel to
+`faultpf`, `clear`, `home`, `ls`, `mkdir`, `touch`, `write`, `cat`, `rm`, `ps`,
+`sysinfo`, `net`, `audio`, `beep`, `apps`, `start`, `focus`, and `close`; COM1 serial
+input remains available. The desktop Files window lists the current DevOS
+filesystem, navigates directories, and previews text files up to 255 bytes.
+The kernel has a lightweight component registry and service status reporting.
+Its 100 Hz timer drives a preemptive round-robin scheduler for bounded kernel
+tasks; a service-monitor task refreshes subsystem readiness, and `ps` shows
+ring-0 and ring-3 tasks and their runtime ticks. A minimal ring-3 demo runs in a
+separate lower-half address space with a private user stack and per-task kernel
+interrupt stack. Its DPL3 `int 0x80` ABI currently supports bounded console
+write and process exit; invalid user pointers are rejected, and user-mode CPU
+exceptions terminate the demo rather than halting the kernel. User mappings
+are supervisor-isolated from the shared kernel half, but NX/W^X, ELF loading,
+general process creation, file/device syscalls, and robust resource limits are
+not implemented. A PIT-driven PC-speaker tone endpoint is available as
+`beep [HZ [MS]]` and from the desktop Audio panel; it is basic square-wave
+output, not a PCM sound card, mixer, or general audio backend. Networking uses
+a QEMU Intel e1000 device with static guest address `10.0.2.15`, ARP, and
+ICMP echo; it can ping the QEMU gateway at `10.0.2.2`. DHCP, TCP/UDP sockets,
+DNS, IPv6, and configurable interfaces are not implemented. The desktop is a
+simple framebuffer window manager without a compositor or animation system.
+`fault` command deliberately halts the kernel to
 test invalid-opcode reporting; `faultpf` deliberately reads unmapped memory
 to test page-fault reporting, including the fault address. Files live in a small
 fixed-capacity filesystem: 63 entries, at most 31 characters per name, and 2
@@ -34,13 +54,20 @@ in memory and are lost at reboot. The kernel enumerates PCI devices and
 reads/writes sectors using primary-master ATA PIO. The persistent filesystem
 occupies raw disk sectors 1-524 (there is no partition table yet) and uses a
 DevOS-specific format, not FAT or NTFS. The dashboard and memory
-reporting require a bootloader that implements the Limine protocol. This is not
-yet a complete desktop: Stage 5 now includes a PS/2 mouse driver and framebuffer
-pointer, but there is no window manager or pointer-driven application behavior.
-Process management, a network interface/protocol stack, and an audio driver are
-also absent. An offline Ethernet/IPv4/ICMP packet-processing core is present
-for Stage 4, but it is not connected to a network device. The dashboard is
-static; there is no animation or frame timer.
+reporting require a bootloader that implements the Limine protocol. The desktop
+now has a small framebuffer window manager: the mouse can open Start, launch
+the terminal or app panels, focus and drag windows, and close them. The Files
+panel is backed by the in-memory/persisted DevOS filesystem; settings currently
+displays system identity/status without configuration controls.
+
+On a filesystem without a valid `/etc/devos.conf`, boot enters a first-run
+setup screen for a username and hostname before starting the shell. The profile
+is saved in the DevOS filesystem and survives reboot only when the supported
+primary-master ATA snapshot disk is present and writable; otherwise the kernel
+reports that it is RAM-only. Names accept ASCII letters, digits, and hyphens,
+up to 31 characters. Existing valid profiles skip setup and are shown on the
+desktop. This is a real, tested setup flow, not a complete Windows-style OOBE:
+there is no account authentication, network configuration, or settings backend.
 
 Example terminal session:
 
@@ -98,12 +125,21 @@ terminal only. `make run` attaches a 16 MiB IDE disk at
 ATA IDENTIFY, and filesystem persistence across a QEMU reboot.
 `make test-pointer` uses QEMU's QMP interface to verify guest mouse motion and
 button events.
+`make test-oobe` verifies first-boot setup and profile persistence across a
+QEMU reboot. The pointer and storage smoke tests also complete the first-run
+setup before testing their respective subsystems.
+`make test-scheduler` verifies that the timer preempts the shell into the
+service-monitor kernel task and that `ps` reports its runtime.
+`make test-audio` exercises the PC-speaker tone command in QEMU.
+`make test-network` verifies e1000/ARP/ICMP reachability to QEMU's gateway, and
+`make test-user-process` verifies the ring-3 demo's isolated write/exit path.
 
 The kernel reports its startup on COM1 (I/O port `0x3f8`). An emulator or machine
 without a serial console may not show this output. `make test` runs host tests
 for framebuffer drawing, keyboard input, the in-memory filesystem, memory
 allocation, persistent-filesystem snapshot recovery, ELF64 validation, and
-Ethernet/IPv4/ICMP packet processing.
+Ethernet/IPv4/ICMP packet processing, desktop windows, file-manager behavior,
+service status, and OOBE profile validation.
 
 ## Five-stage OS plan
 
@@ -147,42 +183,43 @@ driver tests or a reproducible QEMU test.
 Started: the kernel has a bounded ELF64 x86-64 executable inspector, available
 as `elfcheck PATH`. It validates executable headers, loadable segment ranges,
 alignment, user address bounds, and that the entry point belongs to an
-executable segment. It does not yet load or execute a program. Next are virtual
-address spaces, ring-3 entry and return, a syscall ABI, process lifecycle and
-scheduling, and permissions; user programs must not be run until those
-isolation boundaries are implemented. Build developer utilities such as an
-editor, task/process inspection, and system diagnostics on those interfaces
-rather than as kernel-only commands. Completion means independent user
-programs can run, use files and console I/O, and fail without crashing the
-kernel.
+executable segment. It does not yet load or execute ELF files. The prototype
+has a preemptive round-robin scheduler for ring-0 kernel tasks plus one
+ring-3 demo process, separate lower-half page tables and user/kernel stacks,
+and a minimal `int 0x80` write/exit ABI. `make test-user-process` verifies
+isolated entry, validated console output, and process exit in QEMU. This
+proof-of-concept does not provide ELF loading, NX/W^X, general process
+creation, filesystem syscalls, or protection against all kernel bugs. Build
+developer utilities such as an editor, task/process inspection, and system
+diagnostics on those interfaces rather than as kernel-only commands.
+Completion means independent user programs can run, use files and console I/O,
+and fail without crashing the kernel.
 
 ### Stage 4 — Networking and system services
 
 Started: a bounded Ethernet II/IPv4 ICMP packet core validates IP and ICMP
-checksums and can construct echo replies, including IPv4 header options. It
-drops malformed or fragmented ICMP packets and ignores unsupported EtherTypes,
-protocols, and ICMP message types. Host tests cover reply construction,
-malformed frames, capacity handling, and overlapping buffers. This is not live
-networking: no network card driver, interface/address configuration, ARP, UDP,
-TCP, DNS, or socket API is implemented yet. Next add a supported QEMU NIC and
-connect packet I/O with explicit bounds and ownership; then layer address
-configuration and protocols on that tested interface. Define supported
-protocols and security boundaries before exposing network services. Completion
-means the QEMU guest can configure a network interface and pass local
-connectivity tests through QEMU's user-mode network.
+checksums and can construct echo replies. A QEMU Intel e1000 driver connects
+the kernel to user-mode networking using static address `10.0.2.15`, ARP, and
+ICMP echo; `make test-network` verifies gateway reachability at `10.0.2.2`.
+This is limited live networking, not a general network stack: DHCP, interface
+configuration, TCP/UDP sockets, DNS, and IPv6 are not implemented.
+Completion means a configurable interface and broader end-to-end connectivity
+tests.
 
 ### Stage 5 — Desktop, applications, and release hardening (in progress)
 
 Started: PS/2 mouse input uses IRQ12 and a bounded event queue, and the
-framebuffer draws a clipped pointer that restores the pixels behind it.
-`pointer` reports packet, position, and button state. Host tests cover packet
-sync, signed movement, overflow, button state, queue capacity, and cursor
-restoration/clipping. `make test-pointer` injects QMP motion and button events
-and checks that the guest reports the updated pointer state. Pointer clicks do
-not yet activate desktop controls.
-Remaining work includes window management, a composited desktop, responsive
-and reduced-motion-aware animations, settings, accessibility, and useful
-developer-facing applications. Add installation/recovery documentation,
+framebuffer draws a clipped pointer that restores the pixels behind it. The
+pointer activates the Start menu and taskbar, opens terminal/app panels, and
+can focus, drag, or close windows. The Files panel browses real DevOS filesystem
+entries and previews text; the separate file-manager service has host coverage
+for directory traversal, parent navigation, and preview reads. `pointer`
+reports packet, position, and button state. Host tests cover mouse packet
+decoding, window state, Start-menu actions, taskbar launch, close behavior, and
+cursor restoration/clipping. Remaining work includes a file editor and complete
+settings/network applications, a compositor, responsive and
+reduced-motion-aware animations, accessibility, and the user-mode application
+model. Add installation/recovery documentation,
 reproducible releases, security and regression tests, and measure idle and
 working-set memory on the 2 GB QEMU target. Completion means the desktop boots
 and remains usable in the target VM while supported apps, storage, input, and

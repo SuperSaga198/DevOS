@@ -43,10 +43,91 @@
 .size \name, . - \name
 .endm
 
-IRQ_STUB timer_irq_stub, timer_irq_handler
+.global timer_irq_stub
+.type timer_irq_stub, @function
+timer_irq_stub:
+    cld
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, %rdi
+    andq $-16, %rsp
+    call timer_irq_handler
+    movq %rax, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+.size timer_irq_stub, . - timer_irq_stub
+
 IRQ_STUB keyboard_irq_stub, keyboard_irq_handler
 IRQ_STUB mouse_irq_stub, mouse_irq_handler
 IRQ_STUB serial_irq_stub, serial_irq_handler
+
+.global syscall_interrupt_stub
+.type syscall_interrupt_stub, @function
+syscall_interrupt_stub:
+    cld
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, %rdi
+    andq $-16, %rsp
+    call syscall_interrupt_handler
+    movq %rax, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+.size syscall_interrupt_stub, . - syscall_interrupt_stub
 
 .macro EXCEPTION_NO_ERROR vector
 .global exception_stub_\vector
@@ -136,14 +217,28 @@ exception_common_stub:
     movq 120(%rsp), %rdi
     movq 128(%rsp), %rsi
     movq 136(%rsp), %rdx
+    movq %rsp, %rcx
     movq %rsp, %r12
     andq $-16, %rsp
     call kernel_exception_report
-    movq %r12, %rsp
-    cli
-1:
-    hlt
-    jmp 1b
+    movq %rax, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    addq $16, %rsp
+    iretq
 .size exception_common_stub, . - exception_common_stub
 
 .section .note.GNU-stack, "", @progbits

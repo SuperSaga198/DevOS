@@ -11,6 +11,12 @@
 #include "elf64.h"
 #include "ata_pio.h"
 #include "pci.h"
+#include "system.h"
+#include "file_manager.h"
+#include "setup_wizard.h"
+#include "scheduler.h"
+#include "pc_speaker.h"
+#include "e1000.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -99,6 +105,7 @@ static int allocator_available;
 static uint64_t shell_allocated_page;
 static int shell_has_allocated_page;
 static int storage_available;
+static int network_available;
 static int pointer_available;
 static uint64_t pointer_x;
 static uint64_t pointer_y;
@@ -115,6 +122,106 @@ static void persist_filesystem_change(void)
     if (storage_available && !fs_disk_save()) {
         shell_write("warning: change is only in RAM; disk save failed\r\n");
     }
+}
+
+static void service_monitor_task(void *argument)
+{
+    (void)argument;
+    serial_write("Service-monitor kernel task executing.\r\n");
+    uint64_t next_update = timer_ticks();
+    for (;;) {
+        const uint64_t now = timer_ticks();
+        if (now >= next_update) {
+            (void)devos_service_set_state(
+                DEVOS_SERVICE_STORAGE,
+                storage_available ? DEVOS_SERVICE_READY : DEVOS_SERVICE_OFF);
+            (void)devos_service_set_state(
+                DEVOS_SERVICE_NETWORK,
+                network_available ? DEVOS_SERVICE_READY : DEVOS_SERVICE_OFF);
+            (void)devos_service_set_state(
+                DEVOS_SERVICE_AUDIO, DEVOS_SERVICE_READY);
+            (void)devos_service_set_state(
+                DEVOS_SERVICE_DESKTOP,
+                framebuffer_width() != 0 && framebuffer_height() != 0
+                    ? DEVOS_SERVICE_READY : DEVOS_SERVICE_OFF);
+            next_update = now + TIMER_TICKS_PER_SECOND;
+        }
+        __asm__ volatile ("sti; hlt");
+    }
+}
+
+static void network_poll_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        e1000_poll();
+        __asm__ volatile ("sti; hlt");
+    }
+}
+
+extern const uint8_t user_demo_blob_start[];
+extern const uint8_t user_demo_blob_end[];
+
+static int launch_user_demo(void)
+{
+    const size_t image_size = (size_t)(
+        (uintptr_t)user_demo_blob_end - (uintptr_t)user_demo_blob_start);
+    if (image_size == 0 || image_size > PAGE_SIZE) {
+        return 0;
+    }
+
+    uint64_t address_space = 0;
+    uint64_t code_page = 0;
+    uint64_t stack_page = 0;
+    if (!memory_create_user_address_space(&address_space)) {
+        return 0;
+    }
+    if (!page_alloc(&code_page)) {
+        (void)memory_destroy_user_address_space(address_space);
+        return 0;
+    }
+    if (!page_alloc(&stack_page)) {
+        (void)page_free(code_page);
+        (void)memory_destroy_user_address_space(address_space);
+        return 0;
+    }
+
+    uint8_t *code = physical_to_virtual(code_page);
+    uint8_t *stack = physical_to_virtual(stack_page);
+    if (code == NULL || stack == NULL) {
+        (void)page_free(code_page);
+        (void)page_free(stack_page);
+        (void)memory_destroy_user_address_space(address_space);
+        return 0;
+    }
+    for (size_t index = 0; index < PAGE_SIZE; ++index) {
+        code[index] = 0;
+        stack[index] = 0;
+    }
+    for (size_t index = 0; index < image_size; ++index) {
+        code[index] = user_demo_blob_start[index];
+    }
+
+    const int code_mapped = memory_user_map_page(
+        address_space, 0x400000, code_page, 0, 1);
+    const int stack_mapped = code_mapped && memory_user_map_page(
+        address_space, 0x7fffe000, stack_page, 1, 0);
+    if (!code_mapped || !stack_mapped) {
+        (void)memory_destroy_user_address_space(address_space);
+        if (!code_mapped) {
+            (void)page_free(code_page);
+        }
+        if (!stack_mapped) {
+            (void)page_free(stack_page);
+        }
+        return 0;
+    }
+    if (!scheduler_create_user("user-demo", address_space,
+                               0x400000, 0x7ffff000)) {
+        (void)memory_destroy_user_address_space(address_space);
+        return 0;
+    }
+    return 1;
 }
 
 static void shell_write_hex(uint64_t value)
@@ -203,6 +310,155 @@ static size_t text_length(const char *text)
         ++length;
     }
     return length;
+}
+
+static int parse_decimal(const char *text, uint32_t *value)
+{
+    if (text == NULL || value == NULL || *text == '\0') {
+        return 0;
+    }
+    uint32_t parsed = 0;
+    for (size_t index = 0; text[index] != '\0'; ++index) {
+        if (text[index] < '0' || text[index] > '9') {
+            return 0;
+        }
+        const uint32_t digit = (uint32_t)(text[index] - '0');
+        if (parsed > (UINT32_MAX - digit) / 10) {
+            return 0;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    *value = parsed;
+    return 1;
+}
+
+static void desktop_file_manager_refresh(void)
+{
+    struct desktop_file_item visible_items[DESKTOP_FILE_ITEMS_MAX];
+    const size_t count = file_manager_entry_count();
+    for (size_t index = 0; index < count; ++index) {
+        const struct file_manager_entry *entry =
+            file_manager_entry_at(index);
+        if (entry == NULL) {
+            continue;
+        }
+        size_t name_index = 0;
+        while (entry->name[name_index] != '\0' &&
+               name_index + 1 < sizeof(visible_items[index].name)) {
+            visible_items[index].name[name_index] = entry->name[name_index];
+            ++name_index;
+        }
+        visible_items[index].name[name_index] = '\0';
+        visible_items[index].is_directory = entry->is_directory;
+        visible_items[index].size = entry->size;
+    }
+
+    (void)desktop_file_manager_update(file_manager_path(),
+                                      count != 0 ? visible_items : NULL,
+                                      count, file_manager_preview());
+}
+
+static void file_manager_activate(int action)
+{
+    if (action == DESKTOP_ACTION_FILE_PARENT) {
+        file_manager_parent();
+        desktop_file_manager_refresh();
+        return;
+    }
+
+    const int item_index = action - DESKTOP_ACTION_FILE_ITEM_BASE;
+    if (item_index < 0 ||
+        !file_manager_open_entry((size_t)item_index)) {
+        return;
+    }
+    desktop_file_manager_refresh();
+}
+
+static void setup_render(const char *message)
+{
+    const enum setup_wizard_state state = setup_wizard_get_state();
+    const char *input = state == SETUP_WIZARD_USERNAME ||
+                                state == SETUP_WIZARD_HOSTNAME
+                            ? setup_wizard_get_input()
+                            : state == SETUP_WIZARD_COMMIT
+                                  ? "Preparing your profile" : "";
+    framebuffer_setup_draw((uint8_t)state, input, message);
+}
+
+static void setup_try_commit(void)
+{
+    int saved_to_disk = 0;
+    if (storage_available) {
+        if (!fs_disk_save()) {
+            setup_wizard_persist_result(0);
+            setup_render("Disk save failed. Press Enter to retry.");
+            serial_write("OOBE save failed; press Enter to retry.\r\n");
+            return;
+        }
+        saved_to_disk = 1;
+    }
+
+    setup_wizard_persist_result(1);
+    const struct setup_profile *profile = setup_wizard_get_profile();
+    desktop_set_identity(profile->username, profile->hostname);
+    if (saved_to_disk) {
+        serial_write("OOBE setup saved to disk.\r\n");
+    } else {
+        serial_write("OOBE setup complete; no persistent disk, profile is RAM-only.\r\n");
+    }
+}
+
+static void first_run_setup(void)
+{
+    setup_wizard_init();
+    if (setup_wizard_get_state() == SETUP_WIZARD_COMPLETE) {
+        const struct setup_profile *profile = setup_wizard_get_profile();
+        desktop_set_identity(profile->username, profile->hostname);
+        serial_write("OOBE profile loaded: ");
+        serial_write(profile->username);
+        serial_write("@");
+        serial_write(profile->hostname);
+        serial_write("\r\n");
+        return;
+    }
+
+    serial_write("OOBE required. Enter a user name, then a computer name.\r\n");
+    setup_render(NULL);
+    while (setup_wizard_get_state() != SETUP_WIZARD_COMPLETE) {
+        __asm__ volatile ("cli");
+        uint16_t key = 0;
+        uint8_t serial_character = 0;
+        const int have_key = keyboard_get_key(&key);
+        const int have_serial = serial_get_char(&serial_character);
+        if (!have_key && !have_serial) {
+            __asm__ volatile ("sti; hlt");
+            continue;
+        }
+        __asm__ volatile ("sti");
+
+        if (have_key) {
+            setup_wizard_input(key);
+        }
+        if (have_serial) {
+            const uint8_t character = serial_character;
+            if (character == '\n' && last_serial_was_cr) {
+                last_serial_was_cr = 0;
+            } else {
+                last_serial_was_cr = character == '\r';
+                setup_wizard_input(character);
+            }
+        }
+
+        if (setup_wizard_get_state() == SETUP_WIZARD_COMMIT) {
+            setup_try_commit();
+        } else if (setup_wizard_get_state() == SETUP_WIZARD_USERNAME) {
+            setup_render(NULL);
+        } else if (setup_wizard_get_state() == SETUP_WIZARD_HOSTNAME) {
+            setup_render(NULL);
+        } else if (setup_wizard_get_state() == SETUP_WIZARD_SAVE_ERROR) {
+            setup_render("Disk save failed. Press Enter to retry.");
+        }
+    }
 }
 
 static void shell_list(const char *path)
@@ -305,6 +561,15 @@ static void shell_prompt(void)
     shell_write("devos> ");
 }
 
+static void shell_open_terminal(void)
+{
+    terminal_open = 1;
+    command_length = 0;
+    framebuffer_terminal_open();
+    shell_write("DevOS terminal. Type help for commands.\r\n");
+    shell_prompt();
+}
+
 static void shell_execute(void)
 {
     command[command_length] = '\0';
@@ -329,11 +594,21 @@ static void shell_execute(void)
 
     if (command_is("help")) {
         shell_write("Commands:\r\n");
-        shell_write("  help  - show this help\r\n");
-        shell_write("  mem   - show usable memory\r\n");
-        shell_write("  ver   - show kernel version\r\n");
-        shell_write("  clear - clear the terminal\r\n");
-        shell_write("  home  - return to the desktop\r\n");
+        shell_write("  help     - show this help\r\n");
+        shell_write("  mem      - show usable memory\r\n");
+        shell_write("  ver      - show kernel version\r\n");
+        shell_write("  clear    - clear the terminal\r\n");
+        shell_write("  home     - return to the desktop\r\n");
+        shell_write("  apps     - list open desktop windows\r\n");
+        shell_write("  start APP - open a desktop app window\r\n");
+        shell_write("  focus APP - focus an open desktop app\r\n");
+        shell_write("  close APP - close a desktop app window\r\n");
+        shell_write("  ps       - list scheduled kernel tasks\r\n");
+        shell_write("  sysinfo  - show system service readiness\r\n");
+        shell_write("  net      - show network service status\r\n");
+        shell_write("  ping     - send an ICMP echo to the QEMU gateway\r\n");
+        shell_write("  audio    - show audio service status\r\n");
+        shell_write("  beep [HZ [MS]] - play a PC speaker tone\r\n");
         shell_write("  ls [PATH]       - list a RAM filesystem directory\r\n");
         shell_write("  mkdir PATH      - create a directory\r\n");
         shell_write("  touch PATH      - create an empty file\r\n");
@@ -426,6 +701,142 @@ static void shell_execute(void)
         (void)value;
     } else if (command_is("ver")) {
         shell_write("DevOS developer preview, x86-64\r\n");
+    } else if (command_is("apps")) {
+        if (!desktop_window_count()) {
+            shell_write("No open desktop windows\r\n");
+        } else {
+            shell_write("Open windows:\r\n");
+            for (size_t index = 0; index < DESKTOP_WINDOW_MAX; ++index) {
+                const char *window_name = desktop_window_name(index);
+                if (window_name != NULL) {
+                    shell_write("  ");
+                    shell_write(window_name);
+                    shell_write("\r\n");
+                }
+            }
+        }
+    } else if (command_is("start")) {
+        char *app = take_token(&arguments_end);
+        if (app == NULL) {
+            shell_write("start: expected a window name\r\n");
+        } else {
+            if (desktop_window_open(app, 120 + desktop_window_count() * 25,
+                                    90 + desktop_window_count() * 20,
+                                    260, 170,
+                                    0x2a74d1)) {
+                shell_write("Started desktop window: ");
+                shell_write(app);
+                shell_write("\r\n");
+                desktop_draw(detected_memory_mib);
+            } else {
+                shell_write("start: unable to open ");
+                shell_write(app);
+                shell_write("\r\n");
+            }
+        }
+    } else if (command_is("focus")) {
+        char *app = take_token(&arguments_end);
+        if (app == NULL) {
+            shell_write("focus: expected a window name\r\n");
+        } else if (!desktop_window_is_open(app)) {
+            shell_write("focus: window is not open\r\n");
+        } else {
+            desktop_window_focus(app);
+            desktop_draw(detected_memory_mib);
+            shell_write("Focused window: ");
+            shell_write(app);
+            shell_write("\r\n");
+        }
+    } else if (command_is("close")) {
+        char *app = take_token(&arguments_end);
+        if (app == NULL) {
+            shell_write("close: expected a window name\r\n");
+        } else if (!desktop_window_close(app)) {
+            shell_write("close: window not found\r\n");
+        } else {
+            desktop_draw(detected_memory_mib);
+            shell_write("Closed window: ");
+            shell_write(app);
+            shell_write("\r\n");
+        }
+    } else if (command_is("ps")) {
+        struct scheduler_task_info tasks[SCHEDULER_MAX_TASKS];
+        const size_t count =
+            scheduler_task_snapshot(tasks, SCHEDULER_MAX_TASKS);
+        shell_write("STATE    TICKS  TYPE    SCHEDULED TASK\r\n");
+        if (count != 0) {
+            for (size_t index = 0; index < count; ++index) {
+                shell_write(tasks[index].state == SCHEDULER_TASK_RUNNING
+                                ? "running  " :
+                            tasks[index].state == SCHEDULER_TASK_READY
+                                ? "ready    " : "exited   ");
+                shell_write_uint(tasks[index].ticks);
+                shell_write("  ");
+                shell_write(tasks[index].name);
+                shell_write(tasks[index].is_user ? "  ring-3" : "  ring-0");
+                shell_write("\r\n");
+            }
+        } else {
+            shell_write("No scheduled kernel tasks\r\n");
+        }
+    } else if (command_is("sysinfo")) {
+        struct devos_service_status status;
+        if (devos_service_status(&status)) {
+            shell_write("Component registry: ");
+            shell_write(devos_service_state_name(status.component_registry_ready));
+            shell_write("\r\nStorage: ");
+            shell_write(devos_service_state_name(status.storage_ready));
+            shell_write("\r\nNetworking: ");
+            shell_write(devos_service_state_name(status.network_ready));
+            shell_write("\r\nAudio: ");
+            shell_write(devos_service_state_name(status.audio_ready));
+            shell_write("\r\nDesktop: ");
+            shell_write(devos_service_state_name(status.desktop_ready));
+            shell_write("\r\n");
+        }
+    } else if (command_is("net")) {
+        if (!network_available) {
+            shell_write("Network: no supported e1000 NIC detected\r\n");
+        } else {
+            const uint8_t *address = e1000_mac_address();
+            shell_write("e1000 ready; static IPv4 10.0.2.15; MAC ");
+            for (size_t index = 0; index < 6; ++index) {
+                shell_write_hex(address[index]);
+                if (index != 5) {
+                    shell_write(":");
+                }
+            }
+            shell_write("; RX frames ");
+            shell_write_uint(e1000_received_frames());
+            shell_write("; ICMP replies ");
+            shell_write_uint(e1000_echo_replies());
+            shell_write("\r\n");
+        }
+    } else if (command_is("ping")) {
+        if (!network_available) {
+            shell_write("ping: no supported e1000 NIC detected\r\n");
+        } else if (e1000_ping_gateway()) {
+            shell_write("10.0.2.2 replied to ICMP echo\r\n");
+        } else {
+            shell_write("ping: no ICMP reply from 10.0.2.2\r\n");
+        }
+    } else if (command_is("audio")) {
+        shell_write("Audio: PC speaker PIT tone output; no PCM/mixer backend\r\n");
+    } else if (command_is("beep")) {
+        char *frequency_text = take_token(&arguments_end);
+        char *duration_text = take_token(&arguments_end);
+        uint32_t frequency = 880;
+        uint32_t duration = 250;
+        if ((frequency_text != NULL &&
+             !parse_decimal(frequency_text, &frequency)) ||
+            (duration_text != NULL &&
+             !parse_decimal(duration_text, &duration))) {
+            shell_write("beep: use decimal frequency and duration\r\n");
+        } else if (!pc_speaker_play_tone(frequency, duration)) {
+            shell_write("beep: valid range is 20-20000 Hz and 1-2000 ms\r\n");
+        } else {
+            shell_write("PC speaker tone played\r\n");
+        }
     } else if (command_is("clear")) {
         framebuffer_terminal_clear();
     } else if (command_is("ls")) {
@@ -436,6 +847,8 @@ static void shell_execute(void)
         if (path == NULL || !fs_mkdir(path)) {
             shell_write("mkdir: cannot create directory\r\n");
         } else {
+            file_manager_refresh();
+            desktop_file_manager_refresh();
             persist_filesystem_change();
         }
     } else if (command_is("touch")) {
@@ -443,6 +856,8 @@ static void shell_execute(void)
         if (path == NULL || !fs_create(path)) {
             shell_write("touch: cannot create file\r\n");
         } else {
+            file_manager_refresh();
+            desktop_file_manager_refresh();
             persist_filesystem_change();
         }
     } else if (command_is("write")) {
@@ -452,6 +867,8 @@ static void shell_execute(void)
             !fs_write(path, text, text_length(text))) {
             shell_write("write: expected an existing file and text\r\n");
         } else {
+            file_manager_refresh();
+            desktop_file_manager_refresh();
             persist_filesystem_change();
         }
     } else if (command_is("cat")) {
@@ -468,6 +885,8 @@ static void shell_execute(void)
         if (path == NULL || !fs_remove(path)) {
             shell_write("rm: cannot remove path\r\n");
         } else {
+            file_manager_refresh();
+            desktop_file_manager_refresh();
             persist_filesystem_change();
         }
     } else if (command_is("home")) {
@@ -529,16 +948,30 @@ static void kernel_shell(void)
         if (have_pointer_event && framebuffer_width() != 0 &&
             framebuffer_height() != 0) {
             pointer_apply_event(&pointer_event);
+            if (!terminal_open) {
+                const int desktop_action = desktop_pointer_event(
+                    pointer_x, pointer_y, pointer_event.buttons);
+                if (desktop_action == DESKTOP_ACTION_OPEN_TERMINAL) {
+                    shell_open_terminal();
+                } else if (desktop_action == DESKTOP_ACTION_FILE_PARENT ||
+                           desktop_action >= DESKTOP_ACTION_FILE_ITEM_BASE) {
+                    file_manager_activate(desktop_action);
+                    desktop_draw(detected_memory_mib);
+                } else if (desktop_action == DESKTOP_ACTION_AUDIO_TEST_TONE) {
+                    if (!pc_speaker_play_tone(880, 180)) {
+                        serial_write("Desktop audio test tone failed.\r\n");
+                    }
+                    desktop_draw(detected_memory_mib);
+                } else if (desktop_action == DESKTOP_ACTION_REDRAW) {
+                    desktop_draw(detected_memory_mib);
+                }
+            }
         }
 
         if (have_key) {
             if (!terminal_open) {
                 if (key == 't' || key == 'T') {
-                    terminal_open = 1;
-                    command_length = 0;
-                    framebuffer_terminal_open();
-                    shell_write("DevOS terminal. Type help for commands.\r\n");
-                    shell_prompt();
+                    shell_open_terminal();
                 }
             } else {
                 shell_input(key);
@@ -554,11 +987,7 @@ static void kernel_shell(void)
             }
             last_serial_was_cr = input == '\r';
             if (!terminal_open) {
-                terminal_open = 1;
-                command_length = 0;
-                framebuffer_terminal_open();
-                shell_write("DevOS terminal. Type help for commands.\r\n");
-                shell_prompt();
+                shell_open_terminal();
             }
             shell_input(input);
         }
@@ -599,8 +1028,16 @@ void kernel_main(void)
 
     pointer_x = framebuffer_width() / 2;
     pointer_y = framebuffer_height() / 2;
+    devos_system_init();
+    if (framebuffer_width() != 0 && framebuffer_height() != 0) {
+        (void)devos_service_set_state(DEVOS_SERVICE_DESKTOP,
+                                      DEVOS_SERVICE_READY);
+    }
     fs_init();
+    file_manager_init();
+    desktop_file_manager_refresh();
     interrupts_init();
+    pc_speaker_init();
     pointer_available = mouse_is_available();
     if (framebuffer_width() != 0 && framebuffer_height() != 0) {
         framebuffer_cursor_set(pointer_x, pointer_y);
@@ -612,6 +1049,12 @@ void kernel_main(void)
     serial_write("; IDE controllers: ");
     serial_write_uint(pci_ide_controller_count());
     serial_write("\r\n");
+    if (e1000_init()) {
+        network_available = 1;
+        serial_write("Intel e1000 NIC ready at 10.0.2.15.\r\n");
+    } else {
+        serial_write("No supported Intel e1000 NIC; network remains offline.\r\n");
+    }
     if (ata_pio_init()) {
         serial_write("ATA primary master ready: ");
         serial_write_uint(ata_pio_sector_count());
@@ -619,9 +1062,13 @@ void kernel_main(void)
         const int load_result = fs_disk_load();
         if (load_result == FS_DISK_LOAD_OK) {
             storage_available = 1;
+            (void)devos_service_set_state(DEVOS_SERVICE_STORAGE,
+                                          DEVOS_SERVICE_READY);
             serial_write("Persistent filesystem loaded.\r\n");
         } else if (load_result == FS_DISK_LOAD_EMPTY) {
             storage_available = 1;
+            (void)devos_service_set_state(DEVOS_SERVICE_STORAGE,
+                                          DEVOS_SERVICE_READY);
             serial_write("Persistent filesystem blank; changes will be saved.\r\n");
         } else {
             storage_available = 0;
@@ -629,6 +1076,39 @@ void kernel_main(void)
         }
     } else {
         serial_write("ATA primary master not present or unsupported.\r\n");
+    }
+    file_manager_refresh();
+    desktop_file_manager_refresh();
+    first_run_setup();
+    if (framebuffer_width() != 0 && framebuffer_height() != 0) {
+        desktop_draw(detected_memory_mib);
+    }
+    __asm__ volatile ("cli");
+    scheduler_init();
+    uint64_t kernel_address_space;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(kernel_address_space));
+    scheduler_set_kernel_address_space(kernel_address_space);
+    const int network_task_started =
+        network_available &&
+        scheduler_create("network-rx", network_poll_task, NULL);
+    const int monitor_started =
+        scheduler_create("service-monitor", service_monitor_task, NULL);
+    const int user_demo_started =
+        allocator_available && launch_user_demo();
+    __asm__ volatile ("sti");
+    if (!monitor_started) {
+        serial_write("Kernel service monitor failed to start.\r\n");
+    } else {
+        serial_write("Preemptive kernel-task scheduler ready; "
+                     "service monitor started.\r\n");
+    }
+    if (network_available && !network_task_started) {
+        serial_write("Network receive task failed to start.\r\n");
+    }
+    if (!user_demo_started) {
+        serial_write("Ring-3 demo process could not be created.\r\n");
+    } else {
+        serial_write("Ring-3 user-process isolation initialized.\r\n");
     }
     kernel_shell();
 }

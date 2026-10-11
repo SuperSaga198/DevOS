@@ -45,11 +45,23 @@ void serial_write(const char *text)
     if (text == NULL) {
         return;
     }
-    while (*text != '\0') {
+    size_t length = 0;
+    while (text[length] != '\0') {
+        ++length;
+    }
+    serial_write_n((const uint8_t *)text, length);
+}
+
+void serial_write_n(const uint8_t *bytes, size_t length)
+{
+    if (bytes == NULL && length != 0) {
+        return;
+    }
+    for (size_t index = 0; index < length; ++index) {
         while ((inb(0x3fd) & 0x20) == 0) {
             __asm__ volatile ("pause");
         }
-        outb(0x3f8, (uint8_t)*text++);
+        outb(0x3f8, bytes[index]);
     }
 }
 

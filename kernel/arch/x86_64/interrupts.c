@@ -4,6 +4,10 @@
 #include "mouse.h"
 #include "serial.h"
 #include "timer.h"
+#include "tss.h"
+
+#include "../../core/memory.h"
+#include "../../core/scheduler.h"
 
 #include <stdint.h>
 
@@ -24,6 +28,13 @@ struct idt_register {
 
 static struct idt_gate idt[256];
 extern void (*exception_stub_table[32])(void);
+extern void syscall_interrupt_stub(void);
+
+struct syscall_frame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, cs, rflags, rsp, ss;
+};
 
 static inline void outb(uint16_t port, uint8_t value)
 {
@@ -42,14 +53,15 @@ static void io_wait(void)
     outb(0x80, 0);
 }
 
-static void set_gate(uint8_t vector, void (*handler)(void), uint16_t selector)
+static void set_gate(uint8_t vector, void (*handler)(void), uint16_t selector,
+                     uint8_t attributes)
 {
     const uintptr_t address = (uintptr_t)handler;
     idt[vector] = (struct idt_gate) {
         .offset_low = (uint16_t)address,
         .selector = selector,
         .ist = 0,
-        .attributes = 0x8e,
+        .attributes = attributes,
         .offset_middle = (uint16_t)(address >> 16),
         .offset_high = (uint32_t)(address >> 32),
         .reserved = 0,
@@ -92,15 +104,17 @@ static void pic_remap(void)
 void interrupts_init(void)
 {
     __asm__ volatile ("cli");
+    tss_init();
 
     const uint16_t selector = current_code_selector();
     for (uint8_t vector = 0; vector < 32; ++vector) {
-        set_gate(vector, exception_stub_table[vector], selector);
+        set_gate(vector, exception_stub_table[vector], selector, 0x8e);
     }
-    set_gate(0x20, timer_irq_stub, selector);
-    set_gate(0x21, keyboard_irq_stub, selector);
-    set_gate(0x2c, mouse_irq_stub, selector);
-    set_gate(0x24, serial_irq_stub, selector);
+    set_gate(0x20, timer_irq_stub, selector, 0x8e);
+    set_gate(0x21, keyboard_irq_stub, selector, 0x8e);
+    set_gate(0x2c, mouse_irq_stub, selector, 0x8e);
+    set_gate(0x24, serial_irq_stub, selector, 0x8e);
+    set_gate(0x80, syscall_interrupt_stub, selector, 0xee);
 
     const struct idt_register idt_pointer = {
         .limit = (uint16_t)(sizeof(idt) - 1),
@@ -141,10 +155,44 @@ static void serial_write_hex(uint64_t value)
     serial_write(output);
 }
 
-void kernel_exception_report(uint64_t vector, uint64_t error_code,
-                             uint64_t instruction_pointer)
+uintptr_t syscall_interrupt_handler(void *saved_frame)
+{
+    struct syscall_frame *frame = saved_frame;
+    if (frame == NULL) {
+        return 0;
+    }
+    if (frame->rax == 0) {
+        serial_write("Ring-3 process exited cleanly.\r\n");
+        return scheduler_exit_user((uintptr_t)frame);
+    }
+    if (frame->rax == 1) {
+        const size_t length = (size_t)frame->rsi;
+        if (length > 256 ||
+            (length != 0 &&
+             !memory_user_range_readable(
+                 scheduler_current_address_space(),
+                 frame->rdi, length))) {
+            frame->rax = (uint64_t)-1;
+            return (uintptr_t)frame;
+        }
+        serial_write_n((const uint8_t *)(uintptr_t)frame->rdi, length);
+        frame->rax = length;
+        return (uintptr_t)frame;
+    }
+    frame->rax = (uint64_t)-1;
+    return (uintptr_t)frame;
+}
+
+uintptr_t kernel_exception_report(uint64_t vector, uint64_t error_code,
+                                  uint64_t instruction_pointer,
+                                  uintptr_t *saved_frame)
 {
     __asm__ volatile ("cli");
+    if (saved_frame != NULL &&
+        (saved_frame[18] & 3) == 3) {
+        serial_write("\r\nUser process terminated by CPU exception.\r\n");
+        return scheduler_exit_user((uintptr_t)saved_frame);
+    }
     serial_write("\r\nFATAL: CPU exception vector=0x");
     serial_write_hex(vector);
     serial_write(" error=0x");

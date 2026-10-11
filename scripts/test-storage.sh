@@ -26,6 +26,8 @@ run_qemu()
     if [ "$phase" = write ]; then
         {
             sleep 6
+            printf 'devuser\rdevhost\r'
+            sleep 1
             printf 'touch /persisted\r'
             sleep 0.5
             printf 'write /persisted persistent across reboot\r'
@@ -60,9 +62,11 @@ require_log 'PCI enumeration complete:'
 require_log 'IDE controllers: 1'
 require_log 'ATA primary master ready: 32768 sectors'
 require_log 'Persistent filesystem blank; changes will be saved.'
+require_log 'OOBE setup saved to disk.'
 require_log 'devos> write /persisted persistent across reboot'
 
 run_qemu reboot
 require_log 'Persistent filesystem loaded.'
+require_log 'OOBE profile loaded: devuser@devhost'
 require_log 'persistent across reboot'
 echo "PCI/ATA discovery and persistent filesystem reboot test passed."
